@@ -28,6 +28,14 @@ defmodule AlplusSDK.Envelope do
   @server_max_breadcrumbs 100
   @max_breadcrumb_message_chars 2_048
   @max_breadcrumb_category_chars 128
+  # Mirrors the server's `fingerprint` bound (issue #17) and
+  # `sdks/ruby/lib/alplus/envelope.rb`'s `MAX_FINGERPRINT_*` copies -- this
+  # module previously passed `:fingerprint` through uncapped (issue #18
+  # contract testing surfaced the gap against the Ruby SDK), which meant an
+  # oversized fingerprint silently dropped the WHOLE event at the server
+  # rather than being trimmed client-side like every other field here.
+  @max_fingerprint_entries 16
+  @max_fingerprint_chars 256
 
   def sdk_name, do: @sdk_name
   def sdk_version, do: @sdk_version
@@ -172,7 +180,7 @@ defmodule AlplusSDK.Envelope do
       :breadcrumbs,
       cap_breadcrumbs(Keyword.get(opts, :breadcrumbs), @server_max_breadcrumbs)
     )
-    |> Map.put(:fingerprint, Keyword.get(opts, :fingerprint))
+    |> Map.put(:fingerprint, cap_fingerprint(Keyword.get(opts, :fingerprint)))
     |> Map.put(:user, normalize_user(Keyword.get(opts, :user)))
   end
 
@@ -293,6 +301,19 @@ defmodule AlplusSDK.Envelope do
         _ -> acc
       end
     end)
+  end
+
+  # Caps a custom fingerprint override to the server's own bounds: at most
+  # `@max_fingerprint_entries` entries, each at most `@max_fingerprint_chars`
+  # characters. Returns `nil` for a `nil`/empty input so the caller can
+  # omit the wire key.
+  defp cap_fingerprint(nil), do: nil
+  defp cap_fingerprint([]), do: nil
+
+  defp cap_fingerprint(fingerprint) when is_list(fingerprint) do
+    fingerprint
+    |> Enum.take(@max_fingerprint_entries)
+    |> Enum.map(&cap_text(to_string(&1), @max_fingerprint_chars))
   end
 
   defp cap_text(nil, _max), do: nil
