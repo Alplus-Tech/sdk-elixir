@@ -1,0 +1,282 @@
+defmodule AlplusSDKTest do
+  use ExUnit.Case, async: true
+
+  alias AlplusSDK.Client
+
+  setup do
+    bypass = Bypass.open()
+    {:ok, bypass: bypass}
+  end
+
+  defp start_client(bypass, opts \\ []) do
+    name = :"client_#{System.unique_integer([:positive])}"
+
+    default_opts = [
+      name: name,
+      key: "alp_p_test_key_123",
+      base_url: "http://localhost:#{bypass.port}",
+      environment: "test",
+      release: "1.2.3",
+      # Deterministic tests: disable the idle timer, flush explicitly.
+      flush_interval_ms: 0,
+      batch_max_items: 100,
+      batch_max_bytes: 1_000_000
+    ]
+
+    start_supervised!({Client, Keyword.merge(default_opts, opts)})
+    name
+  end
+
+  describe "golden envelope" do
+    test "a captured exception produces the documented POST /e/errors wire shape", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, conn, raw_body})
+        Plug.Conn.resp(conn, 202, Jason.encode!(%{accepted: 1, dropped: 0}))
+      end)
+
+      exception = %RuntimeError{message: "boom"}
+
+      # AlplusSDK.Client genuinely belongs to the :alplus_sdk OTP app (loaded
+      # at test-run time), so `Application.get_application/1` resolves it --
+      # a made-up module like `MyApp.Worker` would not be, and would always
+      # report `in_app: false` regardless of `in_app_otp_apps`.
+      stacktrace = [
+        {AlplusSDK.Client, :do_flush, 1, [file: ~c"lib/alplus_sdk/client.ex", line: 42]},
+        {:erlang, :apply, 2, []}
+      ]
+
+      event_id =
+        AlplusSDK.capture_exception(exception,
+          name: name,
+          stacktrace: stacktrace,
+          tags: %{"customer" => "acme"},
+          in_app_otp_apps: [:alplus_sdk]
+        )
+
+      assert String.starts_with?(event_id, "err_")
+      assert :ok == Client.flush(name, 1_000)
+
+      assert_receive {:request, conn, raw_body}
+      assert [<<"Bearer alp_p_test_key_123">>] = Plug.Conn.get_req_header(conn, "authorization")
+      assert ["application/json"] = Plug.Conn.get_req_header(conn, "content-type")
+
+      envelope = Jason.decode!(raw_body)
+
+      assert %{
+               "header" => %{
+                 "key" => "alp_p_test_key_123",
+                 "sdk" => %{
+                   "name" => "alplus-elixir",
+                   "version" => _version,
+                   "platform" => "elixir"
+                 },
+                 "sent_at" => sent_at
+               },
+               "items" => [item]
+             } = envelope
+
+      assert {:ok, _, _} = DateTime.from_iso8601(sent_at)
+
+      assert %{
+               "id" => ^event_id,
+               "type" => "exception",
+               "level" => "error",
+               "release" => "1.2.3",
+               "environment" => "test",
+               "mechanism" => "generic",
+               "tags" => %{"customer" => "acme"},
+               "exception" => %{
+                 "type" => "RuntimeError",
+                 "value" => "boom",
+                 "stacktrace" => %{
+                   "frames" => [
+                     %{
+                       "function" => "AlplusSDK.Client.do_flush/1",
+                       "file" => "lib/alplus_sdk/client.ex",
+                       "lineno" => 42,
+                       "in_app" => true
+                     },
+                     frame_2
+                   ]
+                 }
+               }
+             } = item
+
+      assert frame_2["in_app"] == false
+      assert {:ok, _, _} = DateTime.from_iso8601(item["timestamp"])
+    end
+  end
+
+  describe "capture_message/3" do
+    test "sends a message item with the given level", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      id = AlplusSDK.capture_message("disk usage high", "warning", name: name)
+      assert :ok == Client.flush(name)
+
+      assert_receive {:request, raw_body}
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      assert item["id"] == id
+      assert item["type"] == "message"
+      assert item["level"] == "warning"
+      assert item["message"] == "disk usage high"
+    end
+
+    test "a non-binary message never raises and is stringified", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      id = AlplusSDK.capture_message(%{unexpected: :map}, "info", name: name)
+      assert String.starts_with?(id, "err_")
+      assert :ok == Client.flush(name)
+
+      assert_receive {:request, raw_body}
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      assert item["message"] =~ "unexpected"
+    end
+  end
+
+  describe "scope options" do
+    test "contexts, breadcrumbs, fingerprint, and user are carried onto the item", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "scoped"},
+        name: name,
+        contexts: %{"extra" => %{"order_id" => "abc123"}},
+        breadcrumbs: [%{"category" => "http", "message" => "GET /orders", "level" => "info"}],
+        fingerprint: ["custom", "group"],
+        user: %{"id" => "user_42", "email" => "dev@example.com"}
+      )
+
+      assert :ok == Client.flush(name)
+      assert_receive {:request, raw_body}
+
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      assert item["contexts"] == %{"extra" => %{"order_id" => "abc123"}}
+
+      assert item["breadcrumbs"] == [
+               %{"category" => "http", "message" => "GET /orders", "level" => "info"}
+             ]
+
+      assert item["fingerprint"] == ["custom", "group"]
+      assert item["user"] == %{"id" => "user_42", "email" => "dev@example.com"}
+    end
+  end
+
+  describe "batching" do
+    test "flushes automatically once batch_max_items is reached", %{bypass: bypass} do
+      name = start_client(bypass, batch_max_items: 2)
+      test_pid = self()
+
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_message("one", "info", name: name)
+      AlplusSDK.capture_message("two", "info", name: name)
+
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => items} = Jason.decode!(raw_body)
+      assert length(items) == 2
+    end
+  end
+
+  describe "fail-safe transport" do
+    test "a 500 response is swallowed, not raised", %{bypass: bypass} do
+      name = start_client(bypass)
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        Plug.Conn.resp(conn, 500, "boom")
+      end)
+
+      AlplusSDK.capture_message("will 500", "error", name: name)
+      assert :ok == Client.flush(name, 1_000)
+    end
+
+    test "a connection failure (endpoint down) is swallowed, not raised", %{bypass: bypass} do
+      name = start_client(bypass)
+      Bypass.down(bypass)
+
+      AlplusSDK.capture_message("endpoint is down", "error", name: name)
+      assert :ok == Client.flush(name, 1_000)
+    end
+
+    test "capture_exception/2 never raises even with a garbage stacktrace", %{bypass: bypass} do
+      name = start_client(bypass)
+      Bypass.down(bypass)
+
+      id =
+        AlplusSDK.capture_exception(:not_an_exception,
+          name: name,
+          stacktrace: :not_a_stacktrace
+        )
+
+      assert String.starts_with?(id, "err_")
+      assert :ok == Client.flush(name, 1_000)
+    end
+
+    test "calling capture_* with no client started never raises and never hits the network" do
+      id =
+        AlplusSDK.capture_exception(%RuntimeError{message: "no client"},
+          name: :nonexistent_client
+        )
+
+      assert String.starts_with?(id, "err_")
+      assert :ok == AlplusSDK.flush(name: :nonexistent_client)
+    end
+  end
+
+  describe "test/noop mode" do
+    test "enabled?: false never enqueues or hits the network", %{bypass: bypass} do
+      name = start_client(bypass, enabled?: false)
+
+      # No `Bypass.expect*/2,4` stub is registered: if the SDK ignored
+      # `enabled?: false` and made a request anyway, Bypass itself would
+      # raise ("no expectation set") and fail this test on `on_exit`.
+      id = AlplusSDK.capture_exception(%RuntimeError{message: "should be dropped"}, name: name)
+      assert String.starts_with?(id, "err_")
+      assert :ok == Client.flush(name, 1_000)
+    end
+  end
+
+  describe "ingest key never logged" do
+    test "inspecting the resolved config redacts the key", %{bypass: bypass} do
+      name = start_client(bypass)
+      config = Client.config(name)
+
+      refute inspect(config) =~ "alp_p_test_key_123"
+      assert inspect(config) =~ "[REDACTED]"
+    end
+  end
+end
