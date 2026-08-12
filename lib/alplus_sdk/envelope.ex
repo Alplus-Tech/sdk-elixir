@@ -16,9 +16,18 @@ defmodule AlplusSDK.Envelope do
   @sdk_name "alplus-elixir"
   @sdk_version Mix.Project.config()[:version] || "0.1.0"
 
+  # Mirrors `packages/sdk/src/core/observe/envelope.ts`'s `MAX_*` constants
+  # and `sdks/ruby/lib/alplus/envelope.rb`'s copies of the same -- all three
+  # SDKs must cap identically so a payload trimmed by one still groups the
+  # same as one trimmed by another.
   @max_message_chars 4_096
   @max_exception_value_chars 4_096
   @max_tags_chars 4_096
+  @max_context_chars 8_192
+  @max_stack_trace_chars 16_384
+  @server_max_breadcrumbs 100
+  @max_breadcrumb_message_chars 2_048
+  @max_breadcrumb_category_chars 128
 
   def sdk_name, do: @sdk_name
   def sdk_version, do: @sdk_version
@@ -60,7 +69,7 @@ defmodule AlplusSDK.Envelope do
         compact(%{
           type: type,
           value: cap_text(value, @max_exception_value_chars),
-          stacktrace: if(frames != [], do: %{frames: frames})
+          stacktrace: if(frames != [], do: %{frames: cap_frames(frames, @max_stack_trace_chars)})
         }),
       mechanism: Keyword.get(opts, :mechanism, "generic")
     }
@@ -137,8 +146,11 @@ defmodule AlplusSDK.Envelope do
   defp put_scope(item, opts) do
     item
     |> Map.put(:tags, cap_tags(Keyword.get(opts, :tags)))
-    |> Map.put(:contexts, Keyword.get(opts, :contexts))
-    |> Map.put(:breadcrumbs, Keyword.get(opts, :breadcrumbs))
+    |> Map.put(:contexts, cap_context(Keyword.get(opts, :contexts), @max_context_chars))
+    |> Map.put(
+      :breadcrumbs,
+      cap_breadcrumbs(Keyword.get(opts, :breadcrumbs), @server_max_breadcrumbs)
+    )
     |> Map.put(:fingerprint, Keyword.get(opts, :fingerprint))
     |> Map.put(:user, Keyword.get(opts, :user))
   end
@@ -148,6 +160,68 @@ defmodule AlplusSDK.Envelope do
 
   defp cap_tags(tags) do
     if byte_size(Jason.encode!(tags)) <= @max_tags_chars, do: tags, else: nil
+  end
+
+  # Caps a JSON-ish context map by its serialized size. A value whose
+  # serialization exceeds `max_chars` is REPLACED by a small truncation
+  # marker rather than cut mid-string (mirrors JS `capContext` /
+  # Ruby `cap_context`): a partial JSON string is unparseable, which is
+  # worse than a shorter one.
+  defp cap_context(nil, _max_chars), do: nil
+
+  defp cap_context(context, max_chars) when is_map(context) do
+    serialized = Jason.encode!(context)
+
+    if byte_size(serialized) <= max_chars do
+      context
+    else
+      %{_truncated: true, _original_chars: byte_size(serialized)}
+    end
+  end
+
+  defp cap_context(other, _max_chars), do: other
+
+  # Drops trailing frames until the serialized array fits `max_chars`,
+  # mirroring JS `capFrames` / Ruby `cap_frames` -- the top (earliest, most
+  # relevant) frames are kept, later/outer frames are dropped first.
+  defp cap_frames([], _max_chars), do: []
+
+  defp cap_frames(frames, max_chars) when is_list(frames) do
+    if byte_size(Jason.encode!(frames)) <= max_chars do
+      frames
+    else
+      frames |> List.delete_at(-1) |> cap_frames(max_chars)
+    end
+  end
+
+  # Caps breadcrumb count to the server's own ceiling, keeping the most
+  # recent entries (mirrors JS `merged.breadcrumbs.slice(-SERVER_MAX_BREADCRUMBS)`),
+  # and caps each entry's `category`/`message` length.
+  defp cap_breadcrumbs(nil, _max_count), do: nil
+
+  defp cap_breadcrumbs(breadcrumbs, max_count) when is_list(breadcrumbs) do
+    breadcrumbs
+    |> Enum.map(&cap_breadcrumb_fields/1)
+    |> Enum.take(-max_count)
+  end
+
+  defp cap_breadcrumbs(other, _max_count), do: other
+
+  defp cap_breadcrumb_fields(breadcrumb) when is_map(breadcrumb) do
+    breadcrumb
+    |> cap_field_if_present(["category", :category], @max_breadcrumb_category_chars)
+    |> cap_field_if_present(["message", :message], @max_breadcrumb_message_chars)
+  end
+
+  defp cap_breadcrumb_fields(other), do: other
+
+  defp cap_field_if_present(map, keys, max) do
+    Enum.reduce(keys, map, fn key, acc ->
+      case Map.fetch(acc, key) do
+        {:ok, value} when is_binary(value) -> Map.put(acc, key, cap_text(value, max))
+        _ -> acc
+      end
+    end)
   end
 
   defp cap_text(nil, _max), do: nil

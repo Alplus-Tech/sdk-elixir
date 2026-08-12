@@ -192,6 +192,133 @@ defmodule AlplusSDKTest do
     end
   end
 
+  describe "size caps (parity with the JS/Ruby SDKs)" do
+    test "oversized contexts are replaced with a truncation marker, not dropped from the send", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      # > MAX_CONTEXT_CHARS (8192) once JSON-encoded.
+      oversized = %{"extra" => %{"blob" => String.duplicate("x", 9_000)}}
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "big context"},
+        name: name,
+        contexts: oversized
+      )
+
+      assert :ok == Client.flush(name)
+      assert_receive {:request, raw_body}
+
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      assert item["contexts"]["_truncated"] == true
+      assert is_integer(item["contexts"]["_original_chars"])
+      assert item["contexts"]["_original_chars"] > 8_192
+      refute Map.has_key?(item["contexts"], "extra")
+    end
+
+    test "stack frames are trimmed to fit MAX_STACK_TRACE_CHARS, keeping the top frames", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      # 300 frames comfortably exceeds MAX_STACK_TRACE_CHARS (16384) once
+      # JSON-encoded; each entry names a distinct, real, loaded module
+      # (AlplusSDK.Client) so `Application.get_application/1` still resolves.
+      big_stacktrace =
+        for n <- 1..300 do
+          {AlplusSDK.Client, :"frame_#{n}", 0, [file: ~c"lib/alplus_sdk/client.ex", line: n]}
+        end
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "deep stack"},
+        name: name,
+        stacktrace: big_stacktrace
+      )
+
+      assert :ok == Client.flush(name)
+      assert_receive {:request, raw_body}
+
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      frames = item["exception"]["stacktrace"]["frames"]
+
+      assert length(frames) < 300
+      assert byte_size(Jason.encode!(frames)) <= 16_384
+      # Top (earliest) frames are kept; trailing frames are dropped first.
+      assert hd(frames)["function"] == "AlplusSDK.Client.frame_1/0"
+    end
+
+    test "breadcrumb count is capped at SERVER_MAX_BREADCRUMBS, keeping the most recent", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      breadcrumbs = for n <- 1..150, do: %{"category" => "nav", "message" => "step #{n}"}
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "many crumbs"},
+        name: name,
+        breadcrumbs: breadcrumbs
+      )
+
+      assert :ok == Client.flush(name)
+      assert_receive {:request, raw_body}
+
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      assert length(item["breadcrumbs"]) == 100
+      # Most recent (highest-numbered) 100 kept, oldest dropped.
+      assert List.first(item["breadcrumbs"])["message"] == "step 51"
+      assert List.last(item["breadcrumbs"])["message"] == "step 150"
+    end
+
+    test "breadcrumb category/message are truncated per-field", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_message("check crumb caps", "info",
+        name: name,
+        breadcrumbs: [
+          %{
+            "category" => String.duplicate("c", 200),
+            "message" => String.duplicate("m", 3_000)
+          }
+        ]
+      )
+
+      assert :ok == Client.flush(name)
+      assert_receive {:request, raw_body}
+
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      [crumb] = item["breadcrumbs"]
+      assert String.length(crumb["category"]) == 128
+      assert String.length(crumb["message"]) == 2_048
+    end
+  end
+
   describe "batching" do
     test "flushes automatically once batch_max_items is reached", %{bypass: bypass} do
       name = start_client(bypass, batch_max_items: 2)
