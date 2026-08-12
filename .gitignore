@@ -1,0 +1,10 @@
+# Elixir SDK build artifacts and fetched deps — never commit these.
+/_build/
+/deps/
+/cover/
+/doc/
+/.fetch
+erl_crash.dump
+*.ez
+*.beam
+/.elixir_ls/
