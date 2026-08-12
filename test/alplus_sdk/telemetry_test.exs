@@ -1,9 +1,10 @@
 defmodule AlplusSDK.TelemetryTest do
   use ExUnit.Case, async: false
 
-  alias AlplusSDK.{Client, Telemetry}
+  alias AlplusSDK.{Client, Session, Telemetry}
 
   setup do
+    Session.clear()
     bypass = Bypass.open()
     name = :"telemetry_client_#{System.unique_integer([:positive])}"
 
@@ -68,5 +69,41 @@ defmodule AlplusSDK.TelemetryTest do
 
     assert :ok == Client.flush(name, 1_000)
     refute_receive :unexpected_request, 200
+  end
+
+  test "a 500 [:phoenix, :error_rendered] event marks the active session crashed (issue #12)", %{
+    bypass: bypass,
+    name: name
+  } do
+    Bypass.stub(bypass, "POST", "/e/errors", fn conn -> Plug.Conn.resp(conn, 202, "{}") end)
+    Session.start()
+
+    :telemetry.execute([:phoenix, :error_rendered], %{duration: 1_000}, %{
+      status: 500,
+      kind: :error,
+      reason: %RuntimeError{message: "controller blew up"},
+      stacktrace: [],
+      log: :error
+    })
+
+    assert :ok == Client.flush(name, 1_000)
+    assert Session.current().status == :crashed
+  end
+
+  test "a 404 [:phoenix, :error_rendered] event does not mark the active session crashed", %{
+    name: name
+  } do
+    Session.start()
+
+    :telemetry.execute([:phoenix, :error_rendered], %{duration: 1_000}, %{
+      status: 404,
+      kind: :error,
+      reason: :no_route,
+      stacktrace: [],
+      log: :debug
+    })
+
+    assert :ok == Client.flush(name, 1_000)
+    assert Session.current().status == :healthy
   end
 end

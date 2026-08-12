@@ -24,7 +24,7 @@ defmodule AlplusSDK.Client do
   use GenServer
   require Logger
 
-  alias AlplusSDK.{Config, Envelope, Id, Transport}
+  alias AlplusSDK.{Config, Dedup, Envelope, Id, Transport}
 
   @type name :: GenServer.name()
 
@@ -60,6 +60,22 @@ defmodule AlplusSDK.Client do
     :exit, _ -> :ok
   end
 
+  @doc """
+  Enqueues an already-built session-outcome item (issue #12), batched off
+  the request path exactly like `enqueue/2` but sent to `POST /e/sessions`
+  on its own queue -- a session outcome never shares a batch with an error
+  event, so a partial `/e/errors` failure can never affect session delivery
+  or vice versa. Fire-and-forget; never blocks the caller.
+  """
+  @spec enqueue_session(name(), map()) :: :ok
+  def enqueue_session(name \\ __MODULE__, item) do
+    GenServer.cast(name, {:enqueue_session, item})
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   @doc "Forces an immediate send of whatever is queued. Returns `:ok` once the attempt (success or swallowed failure) completes, or `:timeout`."
   @spec flush(name(), timeout()) :: :ok | :timeout
   def flush(name \\ __MODULE__, timeout \\ 5_000) do
@@ -75,6 +91,22 @@ defmodule AlplusSDK.Client do
     GenServer.call(name, :config)
   end
 
+  @doc """
+  Resolves an exception dedup signature against this client's cache (see
+  `AlplusSDK.Dedup` for why the cache lives here). A cheap, purely
+  in-memory `GenServer.call` -- never touches the network -- so it is safe
+  to call from `AlplusSDK.capture_exception/2`'s own request path. If the
+  client isn't running, dedup is skipped: `fresh_id` is returned as-is,
+  same as every other "no client" fallback in this package.
+  """
+  @spec resolve_dedup(name(), Dedup.key(), String.t()) ::
+          {:fresh, String.t()} | {:duplicate, String.t()}
+  def resolve_dedup(name \\ __MODULE__, key, fresh_id) do
+    GenServer.call(name, {:resolve_dedup, key, fresh_id})
+  catch
+    :exit, _ -> {:fresh, fresh_id}
+  end
+
   # -- Server ---------------------------------------------------------------
 
   @impl true
@@ -87,8 +119,11 @@ defmodule AlplusSDK.Client do
        config: config,
        queue: [],
        queued_bytes: 0,
+       session_queue: [],
+       session_queued_bytes: 0,
        timer: nil,
-       task_sup: task_sup
+       task_sup: task_sup,
+       dedup: %{}
      }}
   end
 
@@ -114,15 +149,66 @@ defmodule AlplusSDK.Client do
     end
   end
 
+  def handle_cast({:enqueue_session, _item}, %{config: %{enabled?: false}} = state) do
+    {:noreply, state}
+  end
+
+  # `session_queue` is a plain list, not a `SizedQueue` (unlike
+  # `sdks/ruby/lib/alplus/worker.rb`'s bounded queue) -- this guard is its
+  # equivalent bound, dropping the newest item (never blocking the caller)
+  # once `:session_queue_max_items` is reached, so a sustained ingest
+  # outage (every auto-flush failing, nothing ever draining the list)
+  # cannot grow this GenServer's memory without limit.
+  def handle_cast({:enqueue_session, _item}, state)
+      when length(state.session_queue) >= state.config.session_queue_max_items do
+    if state.config.debug,
+      do:
+        Logger.debug(
+          "alplus_sdk: session queue full (max #{state.config.session_queue_max_items}); dropping session"
+        )
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:enqueue_session, item}, state) do
+    item_bytes = Envelope.byte_size_of(item)
+
+    state = %{
+      state
+      | session_queue: [item | state.session_queue],
+        session_queued_bytes: state.session_queued_bytes + item_bytes
+    }
+
+    cond do
+      length(state.session_queue) >= state.config.batch_max_items or
+          state.session_queued_bytes >= state.config.batch_max_bytes ->
+        {:noreply, do_flush_async(cancel_timer(state))}
+
+      state.timer == nil and state.config.flush_interval_ms > 0 ->
+        {:noreply, schedule_timer(state)}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
   @impl true
   def handle_call(:flush, _from, state) do
     {items, state} = drain(cancel_timer(state))
+    {session_items, state} = drain_sessions(state)
     send_batch_sync(state.task_sup, state.config, items)
+    send_session_batch_sync(state.task_sup, state.config, session_items)
     {:reply, :ok, state}
   end
 
   def handle_call(:config, _from, state) do
     {:reply, state.config, state}
+  end
+
+  def handle_call({:resolve_dedup, key, fresh_id}, _from, state) do
+    now = System.system_time(:millisecond)
+    {result, dedup} = Dedup.resolve(state.dedup, key, fresh_id, now)
+    {:reply, result, %{state | dedup: dedup}}
   end
 
   @impl true
@@ -147,23 +233,40 @@ defmodule AlplusSDK.Client do
     {items, %{state | queue: [], queued_bytes: 0}}
   end
 
+  defp drain_sessions(state) do
+    items = Enum.reverse(state.session_queue)
+    {items, %{state | session_queue: [], session_queued_bytes: 0}}
+  end
+
   # Auto-triggered flush (batch-size threshold, idle timer): fires the send
   # in a task under this client's own Task.Supervisor and returns
   # immediately, so a slow/down ingest endpoint never backs up this
-  # GenServer's mailbox -- `enqueue/2` casts must keep being processed while
-  # a send is in flight.
-  defp do_flush_async(%{queue: []} = state), do: state
+  # GenServer's mailbox -- `enqueue/2`/`enqueue_session/2` casts must keep
+  # being processed while a send is in flight.
+  defp do_flush_async(%{queue: [], session_queue: []} = state), do: state
 
   defp do_flush_async(state) do
     {items, state} = drain(state)
+    {session_items, state} = drain_sessions(state)
     send_batch_async(state.task_sup, state.config, items)
+    send_session_batch_async(state.task_sup, state.config, session_items)
     state
   end
 
+  defp send_batch_async(_task_sup, _config, []), do: :ok
+
   defp send_batch_async(task_sup, config, items) do
-    Task.Supervisor.start_child(task_sup, fn -> send_batch(config, items) end,
-      restart: :temporary
-    )
+    start_async(task_sup, config, fn -> send_batch(config, items) end)
+  end
+
+  defp send_session_batch_async(_task_sup, _config, []), do: :ok
+
+  defp send_session_batch_async(task_sup, config, items) do
+    start_async(task_sup, config, fn -> send_session_batch(config, items) end)
+  end
+
+  defp start_async(task_sup, config, fun) do
+    Task.Supervisor.start_child(task_sup, fun, restart: :temporary)
   rescue
     error ->
       if config.debug,
@@ -181,8 +284,18 @@ defmodule AlplusSDK.Client do
   defp send_batch_sync(_task_sup, _config, []), do: :ok
 
   defp send_batch_sync(task_sup, config, items) do
+    await_sync(task_sup, config, fn -> send_batch(config, items) end)
+  end
+
+  defp send_session_batch_sync(_task_sup, _config, []), do: :ok
+
+  defp send_session_batch_sync(task_sup, config, items) do
+    await_sync(task_sup, config, fn -> send_session_batch(config, items) end)
+  end
+
+  defp await_sync(task_sup, config, fun) do
     task_sup
-    |> Task.Supervisor.async_nolink(fn -> send_batch(config, items) end)
+    |> Task.Supervisor.async_nolink(fun)
     |> Task.await(config.receive_timeout + 1_000)
   catch
     :exit, _ ->
@@ -208,6 +321,32 @@ defmodule AlplusSDK.Client do
         do:
           Logger.debug(
             "alplus_sdk: internal error while flushing: #{Exception.format(:error, error, __STACKTRACE__)}"
+          )
+
+      :ok
+  end
+
+  defp send_session_batch(config, items) do
+    envelope = Envelope.build(config, items)
+    body = Jason.encode!(envelope)
+
+    if byte_size(body) > Config.max_envelope_bytes() do
+      if config.debug,
+        do:
+          Logger.debug(
+            "alplus_sdk: dropping oversized session envelope (#{length(items)} sessions)"
+          )
+
+      :ok
+    else
+      Transport.post_sessions(config, body)
+    end
+  rescue
+    error ->
+      if config.debug,
+        do:
+          Logger.debug(
+            "alplus_sdk: internal error while flushing sessions: #{Exception.format(:error, error, __STACKTRACE__)}"
           )
 
       :ok

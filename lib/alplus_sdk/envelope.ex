@@ -94,6 +94,25 @@ defmodule AlplusSDK.Envelope do
     |> compact()
   end
 
+  @doc """
+  Builds a `POST /e/sessions` wire item (issue #12) from an
+  `AlplusSDK.Session.t()`. Carries no PII: `session.id` is opaque and used
+  server-side only for in-window ingest dedup, then discarded (never stored
+  raw) -- matching `Alplus.Observe.SessionEnvelope`, the server parser.
+  """
+  @spec session_item(AlplusSDK.Session.t(), keyword()) :: map()
+  def session_item(%{id: id, status: status, started_at: started_at}, opts \\ []) do
+    %{
+      id: id,
+      status: Atom.to_string(status),
+      started_at: DateTime.to_iso8601(started_at),
+      duration_ms: DateTime.diff(DateTime.utc_now(), started_at, :millisecond),
+      release: Keyword.get(opts, :release),
+      environment: Keyword.get(opts, :environment)
+    }
+    |> compact()
+  end
+
   @doc "Serialized byte size of an already-built item, used for batch-size accounting."
   @spec byte_size_of(map()) :: non_neg_integer()
   def byte_size_of(item), do: item |> Jason.encode!() |> byte_size()
@@ -144,16 +163,68 @@ defmodule AlplusSDK.Envelope do
   end
 
   defp put_scope(item, opts) do
+    contexts = merge_extra_context(Keyword.get(opts, :contexts), Keyword.get(opts, :context))
+
     item
     |> Map.put(:tags, cap_tags(Keyword.get(opts, :tags)))
-    |> Map.put(:contexts, cap_context(Keyword.get(opts, :contexts), @max_context_chars))
+    |> Map.put(:contexts, cap_context(contexts, @max_context_chars))
     |> Map.put(
       :breadcrumbs,
       cap_breadcrumbs(Keyword.get(opts, :breadcrumbs), @server_max_breadcrumbs)
     )
     |> Map.put(:fingerprint, Keyword.get(opts, :fingerprint))
-    |> Map.put(:user, Keyword.get(opts, :user))
+    |> Map.put(:user, normalize_user(Keyword.get(opts, :user)))
   end
+
+  @doc """
+  Normalizes any `:user` value (per-call opt or `AlplusSDK.Scope` ambient
+  user) to the wire `user` shape: string keys `"id"`/`"email"` only, each
+  value stringified. The server's `user_keys` allowlist (`~w(id email)`)
+  rejects the WHOLE item on an unrecognized key, and its `valid_user?`
+  check requires a binary `id`/`email` -- a normal Phoenix integer PK
+  (`%{id: user.id}`) or an atom-keyed map would otherwise silently drop the
+  event. Accepts atom or string keys on the way in; drops anything else,
+  drops `nil` values, and drops down to `nil` (omitted from the wire item)
+  if nothing recognized was present.
+  """
+  @spec normalize_user(map() | nil) :: map() | nil
+  def normalize_user(nil), do: nil
+
+  def normalize_user(user) when is_map(user) do
+    %{}
+    |> maybe_put_user_field("id", fetch_user_field(user, :id))
+    |> maybe_put_user_field("email", fetch_user_field(user, :email))
+    |> case do
+      empty when map_size(empty) == 0 -> nil
+      normalized -> normalized
+    end
+  end
+
+  def normalize_user(_other), do: nil
+
+  defp fetch_user_field(user, key) do
+    case Map.fetch(user, key) do
+      {:ok, value} -> value
+      :error -> Map.get(user, Atom.to_string(key))
+    end
+  end
+
+  defp maybe_put_user_field(map, _key, nil), do: map
+  defp maybe_put_user_field(map, key, value), do: Map.put(map, key, to_string(value))
+
+  # Folds the `:context` convenience option (arbitrary structured data local
+  # to one capture) into `contexts["extra"]`, mirroring JS's `context` ->
+  # `contexts.extra` fold (`client.ts`'s `mergeContext`) and matching the
+  # server's `contexts` wire shape rather than shipping a second top-level
+  # `context` key the parser doesn't recognize.
+  defp merge_extra_context(nil, nil), do: nil
+  defp merge_extra_context(contexts, nil), do: contexts
+  defp merge_extra_context(nil, extra), do: %{"extra" => extra}
+
+  defp merge_extra_context(contexts, extra) when is_map(contexts),
+    do: Map.put(contexts, "extra", extra)
+
+  defp merge_extra_context(contexts, _extra), do: contexts
 
   defp cap_tags(nil), do: nil
   defp cap_tags(tags) when map_size(tags) == 0, do: nil

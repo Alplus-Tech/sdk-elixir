@@ -340,15 +340,21 @@ defmodule AlplusSDKTest do
   end
 
   describe "fail-safe transport" do
-    test "a 500 response is swallowed, not raised", %{bypass: bypass} do
+    test "a 500 response is retried up to 3 attempts then swallowed, not raised", %{
+      bypass: bypass
+    } do
       name = start_client(bypass)
 
-      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+      # 500 is retryable (not one of the permanent 400/401/403/404
+      # statuses), so the transport's retry loop hits this endpoint up to
+      # `@max_attempts` (3) times before giving up -- `expect/4` (not
+      # `expect_once/4`) allows every one of those calls.
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
         Plug.Conn.resp(conn, 500, "boom")
       end)
 
       AlplusSDK.capture_message("will 500", "error", name: name)
-      assert :ok == Client.flush(name, 1_000)
+      assert :ok == Client.flush(name, 5_000)
     end
 
     test "a connection failure (endpoint down) is swallowed, not raised", %{bypass: bypass} do
@@ -356,7 +362,7 @@ defmodule AlplusSDKTest do
       Bypass.down(bypass)
 
       AlplusSDK.capture_message("endpoint is down", "error", name: name)
-      assert :ok == Client.flush(name, 1_000)
+      assert :ok == Client.flush(name, 5_000)
     end
 
     test "capture_exception/2 never raises even with a garbage stacktrace", %{bypass: bypass} do
@@ -370,7 +376,7 @@ defmodule AlplusSDKTest do
         )
 
       assert String.starts_with?(id, "err_")
-      assert :ok == Client.flush(name, 1_000)
+      assert :ok == Client.flush(name, 5_000)
     end
 
     test "calling capture_* with no client started never raises and never hits the network" do
@@ -404,6 +410,198 @@ defmodule AlplusSDKTest do
 
       refute inspect(config) =~ "alp_p_test_key_123"
       assert inspect(config) =~ "[REDACTED]"
+    end
+  end
+
+  describe "capture_exception/2 dedup (issue #15)" do
+    test "the same error captured twice within the window reports once", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      exception = %RuntimeError{message: "duplicate me"}
+
+      id1 = AlplusSDK.capture_exception(exception, name: name)
+      id2 = AlplusSDK.capture_exception(exception, name: name)
+
+      assert id1 == id2
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+
+      %{"items" => items} = Jason.decode!(raw_body)
+      assert length(items) == 1
+      assert hd(items)["id"] == id1
+
+      # No second request: `Bypass.expect_once/4` would fail `on_exit` if
+      # the duplicate had been enqueued and flushed too.
+    end
+
+    test "a structurally different error is not deduplicated", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      id1 = AlplusSDK.capture_exception(%RuntimeError{message: "one"}, name: name)
+      id2 = AlplusSDK.capture_exception(%RuntimeError{message: "two"}, name: name)
+
+      assert id1 != id2
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => items} = Jason.decode!(raw_body)
+      assert length(items) == 2
+    end
+  end
+
+  describe "scope options (issue #17)" do
+    test "AlplusSDK.Scope ambient values are carried onto the item and merged with per-call opts",
+         %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      AlplusSDK.Scope.clear()
+      AlplusSDK.Scope.set_user(%{"id" => "ambient_user"})
+      AlplusSDK.Scope.set_tag("ambient_tag", "yes")
+      AlplusSDK.Scope.set_context("request", %{"path" => "/orders"})
+      AlplusSDK.Scope.add_breadcrumb(%{"category" => "nav", "message" => "ambient crumb"})
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "scoped by ambient"},
+        name: name,
+        tags: %{"call_tag" => "override"},
+        breadcrumbs: [%{"category" => "http", "message" => "call crumb"}]
+      )
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => [item]} = Jason.decode!(raw_body)
+
+      assert item["user"] == %{"id" => "ambient_user"}
+      assert item["tags"] == %{"ambient_tag" => "yes", "call_tag" => "override"}
+      assert item["contexts"]["request"] == %{"path" => "/orders"}
+
+      assert item["breadcrumbs"] == [
+               %{"category" => "nav", "message" => "ambient crumb"},
+               %{"category" => "http", "message" => "call crumb"}
+             ]
+
+      AlplusSDK.Scope.clear()
+    end
+
+    test "an explicit user: nil override clears the ambient user for that one capture", %{
+      bypass: bypass
+    } do
+      name = start_client(bypass)
+      test_pid = self()
+
+      AlplusSDK.Scope.clear()
+      AlplusSDK.Scope.set_user(%{"id" => "ambient_user"})
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "cleared user"}, name: name, user: nil)
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => [item]} = Jason.decode!(raw_body)
+      refute Map.has_key?(item, "user")
+
+      AlplusSDK.Scope.clear()
+    end
+
+    test "the :context convenience option folds into contexts.extra", %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "with context"},
+        name: name,
+        contexts: %{"named" => %{"a" => 1}},
+        context: %{"order_id" => "abc123"}
+      )
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => [item]} = Jason.decode!(raw_body)
+
+      assert item["contexts"] == %{
+               "named" => %{"a" => 1},
+               "extra" => %{"order_id" => "abc123"}
+             }
+    end
+
+    test "a user with a non-binary id (a normal Phoenix integer PK) is stringified, not dropped",
+         %{bypass: bypass} do
+      name = start_client(bypass)
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.capture_exception(%RuntimeError{message: "integer pk user"},
+        name: name,
+        user: %{id: 12_345, email: "dev@example.com"}
+      )
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      %{"items" => [item]} = Jason.decode!(raw_body)
+
+      assert item["user"] == %{"id" => "12345", "email" => "dev@example.com"}
+    end
+  end
+
+  describe "sample_rate (issue #17)" do
+    test "sample_rate 0.0 drops the capture without hitting the network", %{bypass: bypass} do
+      name = start_client(bypass, sample_rate: 0.0)
+
+      # No `Bypass.expect*/2,4` stub is registered: a request would fail
+      # `on_exit` the same way `enabled?: false`'s test above relies on.
+      id = AlplusSDK.capture_message("should be sampled out", "info", name: name)
+      assert String.starts_with?(id, "err_")
+      assert :ok == Client.flush(name, 1_000)
+    end
+
+    test "a sampled-out capture does not poison dedup for a later sampled-in capture of the same error",
+         %{bypass: bypass} do
+      name = start_client(bypass, sample_rate: 0.0)
+      exception = %RuntimeError{message: "sampled out then dedup-checked"}
+
+      # sample_rate: 0.0 drops every capture, so this must never register a
+      # dedup entry -- if it did (the bug this test guards against),
+      # `Client.resolve_dedup/3` below would come back `:duplicate` even
+      # though nothing was ever actually sent for this signature.
+      AlplusSDK.capture_exception(exception, name: name)
+      AlplusSDK.capture_exception(exception, name: name)
+
+      assert {:fresh, "probe_id"} ==
+               Client.resolve_dedup(name, AlplusSDK.Dedup.signature(exception), "probe_id")
     end
   end
 end

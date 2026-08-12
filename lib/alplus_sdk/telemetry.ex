@@ -42,6 +42,16 @@ defmodule AlplusSDK.Telemetry do
   @doc false
   def handle_event([:phoenix, :error_rendered], _measurements, metadata, %{name: name}) do
     if capture?(metadata) do
+      # Runs synchronously, in the request process, inside
+      # `Phoenix.Endpoint.RenderErrors`'s rescue -- this IS the
+      # unhandled-exception signal for the request-scoped session (issue
+      # #12, ARCHITECTURE.md decision #2: crashed = unhandled/fatal only).
+      # Marked BEFORE the `capture_exception` call below: that call would
+      # otherwise mark the session merely `:errored` (any `"error"`-level
+      # capture does), and `:crashed` must win regardless of call order --
+      # `AlplusSDK.Session`'s severity ordering makes this safe either way.
+      AlplusSDK.mark_session_crashed()
+
       AlplusSDK.capture_exception(
         normalize(metadata),
         stacktrace: Map.get(metadata, :stacktrace, []),
