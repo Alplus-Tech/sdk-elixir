@@ -28,15 +28,47 @@ defmodule AlplusSDK.ContractTest do
 
   alias AlplusSDK.Envelope
 
-  @contract_dir Path.expand("../../../contract", __DIR__)
-  @external_resource Path.join(@contract_dir, "exception_item.json")
-  @external_resource Path.join(@contract_dir, "message_item.json")
-  @external_resource Path.join(@contract_dir, "session_item.json")
-
+  @contract_version "1.0.0"
   @non_deterministic_keys ~w(id timestamp started_at duration_ms)
 
+  # The golden contract is owned by the AL+ product (Alplus-Tech/alplus) and
+  # consumed as an explicit, immutable input (issue #26): ALPLUS_CONTRACT_DIR
+  # points at a checkout of `sdks/contract` at the pinned contract tag. There is
+  # no monorepo-relative fallback -- an absent variable fails loudly.
+  defp contract_dir do
+    case System.get_env("ALPLUS_CONTRACT_DIR") do
+      nil ->
+        raise """
+        ALPLUS_CONTRACT_DIR is not set. The golden contract is a versioned input \
+        owned by Alplus-Tech/alplus. Point ALPLUS_CONTRACT_DIR at a checkout of \
+        sdks/contract at the contract-v#{@contract_version} tag, then rerun.
+        """
+
+      dir ->
+        verify_manifest!(dir)
+        dir
+    end
+  end
+
+  defp verify_manifest!(dir) do
+    manifest = dir |> Path.join("manifest.json") |> File.read!() |> Jason.decode!()
+
+    unless manifest["version"] == @contract_version do
+      raise "contract version mismatch: pinned #{@contract_version}, got #{manifest["version"]}"
+    end
+
+    Enum.each(manifest["items"], fn {name, expected} ->
+      digest = dir |> Path.join(name) |> File.read!() |> then(&:crypto.hash(:sha256, &1))
+      actual = "sha256:" <> Base.encode16(digest, case: :lower)
+
+      unless actual == expected do
+        raise "contract checksum mismatch for #{name}: expected #{expected}, got #{actual}"
+      end
+    end)
+  end
+
   defp golden(name) do
-    @contract_dir |> Path.join(name) |> File.read!() |> Jason.decode!()
+    contract_dir() |> Path.join(name) |> File.read!() |> Jason.decode!()
   end
 
   defp normalize(item) when is_map(item) do

@@ -1,0 +1,54 @@
+# Release for alplus_sdk to Hex, destined for Alplus-Tech/sdk-elixir.
+# Manual or tag-driven only; a product change can never publish an SDK.
+#
+# Publishing prefers Hex trusted publishing (OIDC). If configured on the
+# alplus_sdk Hex package, drop HEX_API_KEY and let `mix hex.publish` use the
+# OIDC token. Otherwise set HEX_API_KEY as a repository secret in
+# Alplus-Tech/sdk-elixir.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # Hex trusted publishing (OIDC)
+
+env:
+  OTP_VERSION: "27.2"
+  ELIXIR_VERSION: "1.18.1"
+  CONTRACT_REF: contract-v1.0.0
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the pinned contract
+        uses: actions/checkout@v4
+        with:
+          repository: Alplus-Tech/alplus
+          ref: ${{ env.CONTRACT_REF }}
+          token: ${{ secrets.CONTRACT_REPO_TOKEN }}
+          sparse-checkout: sdks/contract
+          path: .contract-src
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - run: mix deps.get
+      - name: Verify before publish
+        env:
+          ALPLUS_CONTRACT_DIR: ${{ github.workspace }}/.contract-src/sdks/contract
+        run: mix test
+      - name: Build the package
+        run: mix hex.build
+      - name: Publish to Hex
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes

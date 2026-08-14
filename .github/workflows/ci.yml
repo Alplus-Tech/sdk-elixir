@@ -1,0 +1,59 @@
+# CI for the Elixir SDK (alplus_sdk), destined for Alplus-Tech/sdk-elixir.
+# Lives inside sdks/elixir so it becomes the repo-root workflow after the split
+# (issue #26). GitHub ignores it in the monorepo (only repo-root workflows run).
+#
+# The contract test consumes the product's versioned golden fixtures as an
+# explicit input: this job checks out sdks/contract from Alplus-Tech/alplus at a
+# pinned tag and sets ALPLUS_CONTRACT_DIR. No local fallback.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTP_VERSION: "27.2"
+  ELIXIR_VERSION: "1.18.1"
+  CONTRACT_REF: contract-v1.0.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the pinned contract
+        uses: actions/checkout@v4
+        with:
+          repository: Alplus-Tech/alplus
+          ref: ${{ env.CONTRACT_REF }}
+          token: ${{ secrets.CONTRACT_REPO_TOKEN }}
+          sparse-checkout: sdks/contract
+          path: .contract-src
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: mix-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            mix-${{ env.OTP_VERSION }}-${{ env.ELIXIR_VERSION }}-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix format --check-formatted
+      - name: Unit and contract tests
+        env:
+          ALPLUS_CONTRACT_DIR: ${{ github.workspace }}/.contract-src/sdks/contract
+        run: mix test
