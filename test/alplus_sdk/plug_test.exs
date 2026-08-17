@@ -28,6 +28,31 @@ defmodule AlplusSDK.PlugTest do
     assert [foo: :bar] == AlplusSDK.Plug.init(foo: :bar)
   end
 
+  test "call/2 attaches request context from a real conn, with allowlisted headers only" do
+    conn =
+      Plug.Test.conn(:post, "/orders?coupon=SAVE10")
+      |> Plug.Conn.put_req_header("user-agent", "TestBrowser/1.0")
+      |> Plug.Conn.put_req_header("cookie", "session=shh")
+      |> Plug.Conn.put_req_header("authorization", "Bearer shh")
+
+    AlplusSDK.Plug.call(conn, AlplusSDK.Plug.init([]))
+
+    assert %{
+             "method" => "POST",
+             "path" => "/orders",
+             "host" => "www.example.com",
+             "headers" => %{"user-agent" => "TestBrowser/1.0"}
+           } = Scope.current().contexts["request"]
+
+    refute Map.has_key?(Scope.current().contexts["request"]["headers"], "cookie")
+    refute Map.has_key?(Scope.current().contexts["request"]["headers"], "authorization")
+  end
+
+  test "call/2 attaches no request context for a bare assigns map" do
+    AlplusSDK.Plug.call(%{assigns: %{}}, AlplusSDK.Plug.init([]))
+    assert Scope.current().contexts == %{}
+  end
+
   test "call/2 opens a fresh healthy session (issue #12)" do
     conn = %{assigns: %{}}
     AlplusSDK.Plug.call(conn, AlplusSDK.Plug.init([]))
