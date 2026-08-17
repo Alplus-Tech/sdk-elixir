@@ -27,7 +27,12 @@ defmodule AlplusSDK.Config do
             in_app_otp_apps: [],
             sample_rate: 1.0,
             debug: false,
-            session_queue_max_items: 1_000
+            session_queue_max_items: 1_000,
+            # Post-error log window in ms (issue #47): an exception item
+            # lingers in the client so Logger lines the erroring process
+            # writes just afterwards join its breadcrumb timeline, marked
+            # `after_error`. `0` disables; `flush/2` seals immediately.
+            post_error_log_window_ms: 2_000
 
   @type t :: %__MODULE__{
           key: String.t(),
@@ -42,7 +47,8 @@ defmodule AlplusSDK.Config do
           in_app_otp_apps: [atom()],
           sample_rate: float(),
           debug: boolean(),
-          session_queue_max_items: pos_integer()
+          session_queue_max_items: pos_integer(),
+          post_error_log_window_ms: non_neg_integer()
         }
 
   @max_envelope_bytes 1_048_576

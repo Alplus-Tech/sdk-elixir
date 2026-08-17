@@ -53,7 +53,24 @@ defmodule AlplusSDK.Client do
   @doc "Enqueues an already-built wire item. Fire-and-forget; never blocks the caller on network I/O."
   @spec enqueue(name(), map()) :: :ok
   def enqueue(name \\ __MODULE__, item) do
-    GenServer.cast(name, {:enqueue, item})
+    # The caller pid travels with the item: the post-error log window
+    # (issue #47) attributes after-lines to the process that captured.
+    GenServer.cast(name, {:enqueue, item, self()})
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
+  Offers a log-line breadcrumb (issue #47) to every exception item this
+  process captured that is still inside its post-error log window. Called
+  by `AlplusSDK.LoggerHandler` from the logging process; a no-op with
+  nothing pending. Fire-and-forget; never blocks or raises.
+  """
+  @spec notify_log_breadcrumb(name(), map()) :: :ok
+  def notify_log_breadcrumb(name \\ __MODULE__, crumb) do
+    GenServer.cast(name, {:log_breadcrumb, self(), crumb})
   rescue
     _ -> :ok
   catch
@@ -123,30 +140,59 @@ defmodule AlplusSDK.Client do
        session_queued_bytes: 0,
        timer: nil,
        task_sup: task_sup,
-       dedup: %{}
+       dedup: %{},
+       # ref => %{item, origin, appended} — exception items inside their
+       # post-error log window (issue #47).
+       pending: %{}
      }}
   end
 
   @impl true
-  def handle_cast({:enqueue, _item}, %{config: %{enabled?: false}} = state) do
+  def handle_cast({:enqueue, _item, _origin}, %{config: %{enabled?: false}} = state) do
     {:noreply, state}
   end
 
-  def handle_cast({:enqueue, item}, state) do
-    item_bytes = Envelope.byte_size_of(item)
-    state = %{state | queue: [item | state.queue], queued_bytes: state.queued_bytes + item_bytes}
+  # An exception item enters the post-error log window (issue #47) instead
+  # of the queue: it lingers `post_error_log_window_ms` so Logger lines its
+  # origin process writes just after the error can join it. Everything
+  # else (messages; window disabled) queues immediately.
+  def handle_cast({:enqueue, item, origin}, state) do
+    window = state.config.post_error_log_window_ms
 
-    cond do
-      length(state.queue) >= state.config.batch_max_items or
-          state.queued_bytes >= state.config.batch_max_bytes ->
-        {:noreply, do_flush_async(cancel_timer(state))}
-
-      state.timer == nil and state.config.flush_interval_ms > 0 ->
-        {:noreply, schedule_timer(state)}
-
-      true ->
-        {:noreply, state}
+    if window > 0 and item[:type] == "exception" do
+      ref = make_ref()
+      Process.send_after(self(), {:seal_pending, ref}, window)
+      {:noreply, put_in(state.pending[ref], %{item: item, origin: origin, appended: 0})}
+    else
+      {:noreply, push_item(state, item)}
     end
+  end
+
+  @max_after_error_breadcrumbs 20
+  @max_total_breadcrumbs 100
+
+  def handle_cast({:log_breadcrumb, origin, crumb}, state) do
+    pending =
+      Map.new(state.pending, fn
+        {ref, %{origin: ^origin, appended: appended} = entry}
+        when appended < @max_after_error_breadcrumbs ->
+          crumbs = entry.item[:breadcrumbs] || []
+
+          if length(crumbs) < @max_total_breadcrumbs do
+            marked =
+              Map.update(crumb, :data, %{after_error: true}, &Map.put(&1, :after_error, true))
+
+            item = Map.put(entry.item, :breadcrumbs, crumbs ++ [marked])
+            {ref, %{entry | item: item, appended: appended + 1}}
+          else
+            {ref, entry}
+          end
+
+        {ref, entry} ->
+          {ref, entry}
+      end)
+
+    {:noreply, %{state | pending: pending}}
   end
 
   def handle_cast({:enqueue_session, _item}, %{config: %{enabled?: false}} = state) do
@@ -194,6 +240,9 @@ defmodule AlplusSDK.Client do
 
   @impl true
   def handle_call(:flush, _from, state) do
+    # Seal the post-error log window first: flush means "send now with
+    # whatever after-lines were collected so far", never "wait".
+    state = seal_all_pending(state)
     {items, state} = drain(cancel_timer(state))
     {session_items, state} = drain_sessions(state)
     send_batch_sync(state.task_sup, state.config, items)
@@ -214,6 +263,37 @@ defmodule AlplusSDK.Client do
   @impl true
   def handle_info(:flush_timer, state) do
     {:noreply, do_flush_async(%{state | timer: nil})}
+  end
+
+  def handle_info({:seal_pending, ref}, state) do
+    case Map.pop(state.pending, ref) do
+      {nil, _pending} -> {:noreply, state}
+      {entry, pending} -> {:noreply, push_item(%{state | pending: pending}, entry.item)}
+    end
+  end
+
+  # The shared enqueue tail: queue the item and apply the batch/timer rules.
+  defp push_item(state, item) do
+    item_bytes = Envelope.byte_size_of(item)
+    state = %{state | queue: [item | state.queue], queued_bytes: state.queued_bytes + item_bytes}
+
+    cond do
+      length(state.queue) >= state.config.batch_max_items or
+          state.queued_bytes >= state.config.batch_max_bytes ->
+        do_flush_async(cancel_timer(state))
+
+      state.timer == nil and state.config.flush_interval_ms > 0 ->
+        schedule_timer(state)
+
+      true ->
+        state
+    end
+  end
+
+  defp seal_all_pending(state) do
+    state.pending
+    |> Map.values()
+    |> Enum.reduce(%{state | pending: %{}}, fn entry, acc -> push_item(acc, entry.item) end)
   end
 
   defp schedule_timer(state) do
