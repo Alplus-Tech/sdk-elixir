@@ -1,0 +1,16 @@
+# Fixture file for Stack source-context specs.
+# Line numbers below are load-bearing: the spec asserts on specific source
+# lines by number, so do not reformat this file.
+defmodule AlplusSDK.SourceContextSample do
+  def above_the_raise do
+    "line six"
+  end
+
+  def raise_here do
+    raise "boom on line ten"
+  end
+
+  def below_the_raise do
+    "line fourteen"
+  end
+end

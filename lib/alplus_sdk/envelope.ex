@@ -1,20 +1,14 @@
 defmodule AlplusSDK.Envelope do
-  @moduledoc """
-  Builds the `POST /e/errors` wire envelope and individual items, mirroring
-  `packages/sdk/src/core/observe/{envelope,client}.ts` and validated against
-  `Alplus.Observe.ErrorEnvelope` (the server parser) so a captured event is
-  never dropped as malformed by the caps below.
+  @moduledoc false
 
-  `Jason.encode!/1` on a `nil` map value omits the key by default only if we
-  build maps without the key at all -- every builder here uses `compact/1`
-  to drop `nil` values before encoding, matching the server's `exact_keys?`
-  check (an unexpected `null`-valued key is still a present key).
-  """
-
-  alias AlplusSDK.Config
+  alias AlplusSDK.{Config, Stack}
 
   @sdk_name "alplus-elixir"
   @sdk_version Mix.Project.config()[:version] || "0.1.0"
+  # The server accepts an exception `cause` chain up to depth 5 counting
+  # the top-level exception (`Alplus.Observe.ErrorEnvelope`); walk at most
+  # 4 causes so a cyclic or absurd chain can never build an over-deep item.
+  @max_cause_depth 4
 
   # Mirrors `packages/sdk/src/core/observe/envelope.ts`'s `MAX_*` constants
   # and `sdks/ruby/lib/alplus/envelope.rb`'s copies of the same -- all three
@@ -57,14 +51,21 @@ defmodule AlplusSDK.Envelope do
   Builds an `"exception"` item. `stacktrace` is an Elixir stacktrace
   (`[{module, fun, arity, location}]` or already-built wire frames);
   `in_app_otp_apps` marks a frame `in_app: true` when its module belongs to
-  one of the host's own OTP applications.
+  one of the host's own OTP applications. `context_lines` (default 0 at
+  this layer; `AlplusSDK.Config` defaults to 3) attaches
+  `pre_context`/`context_line`/`post_context` on those in-app frames.
+
+  `:cause` / `:cause_stacktrace` walk a Honeybadger/Sentry-style cause
+  chain (Elixir has no `Exception.cause/1` on 1.15–1.19). A struct field
+  `:cause` is also walked when present. Depth-bounded at #{@max_cause_depth}.
   """
   @spec exception_item(String.t(), Exception.t() | term(), keyword()) :: map()
   def exception_item(id, exception, opts \\ []) do
     {type, value} = exception_type_and_value(exception)
     stacktrace = Keyword.get(opts, :stacktrace, [])
     in_app_otp_apps = Keyword.get(opts, :in_app_otp_apps, [])
-    frames = build_frames(stacktrace, in_app_otp_apps)
+    context_lines = Keyword.get(opts, :context_lines, 0)
+    frames = Stack.frames(stacktrace, in_app_otp_apps, context_lines)
 
     %{
       id: id,
@@ -77,7 +78,8 @@ defmodule AlplusSDK.Envelope do
         compact(%{
           type: type,
           value: cap_text(value, @max_exception_value_chars),
-          stacktrace: if(frames != [], do: %{frames: cap_frames(frames, @max_stack_trace_chars)})
+          stacktrace: if(frames != [], do: %{frames: cap_frames(frames, @max_stack_trace_chars)}),
+          cause: build_cause(extract_cause(exception, opts), opts, @max_cause_depth)
         }),
       mechanism: Keyword.get(opts, :mechanism, "generic")
     }
@@ -133,41 +135,40 @@ defmodule AlplusSDK.Envelope do
     {"Error", inspect(other)}
   end
 
-  defp build_frames(stacktrace, in_app_otp_apps) when is_list(stacktrace) do
-    stacktrace
-    |> Enum.map(&build_frame(&1, in_app_otp_apps))
-    |> Enum.reject(&is_nil/1)
-  end
+  # Walks a cause chain into the wire `exception.cause` shape. Elixir
+  # 1.15–1.19 has no `Exception.cause/1` (Ruby `Exception#cause` / JS
+  # `Error#cause`); callers pass `:cause` / `:cause_stacktrace`, or the
+  # exception struct carries a `:cause` field. A non-exception cause is
+  # dropped rather than serialized, matching the JS SDK.
+  defp build_cause(_exception, _opts, depth) when depth <= 0, do: nil
 
-  defp build_frames(_, _), do: []
+  defp build_cause(%_{__exception__: true} = exception, opts, depth) do
+    {type, value} = exception_type_and_value(exception)
+    in_app_otp_apps = Keyword.get(opts, :in_app_otp_apps, [])
+    context_lines = Keyword.get(opts, :context_lines, 0)
+    stacktrace = Keyword.get(opts, :cause_stacktrace, [])
+    frames = Stack.frames(stacktrace, in_app_otp_apps, context_lines)
 
-  defp build_frame({module, function, arity, location}, in_app_otp_apps) when is_list(location) do
     compact(%{
-      function: format_mfa(module, function, arity),
-      file: location[:file] && to_string(location[:file]),
-      lineno: location[:line],
-      in_app: in_app?(module, in_app_otp_apps)
+      type: type,
+      value: cap_text(value, @max_exception_value_chars),
+      stacktrace: if(frames != [], do: %{frames: cap_frames(frames, @max_stack_trace_chars)}),
+      cause:
+        build_cause(nested_cause(exception), Keyword.delete(opts, :cause_stacktrace), depth - 1)
     })
   end
 
-  defp build_frame(%{} = wire_frame, _in_app_otp_apps), do: wire_frame
+  defp build_cause(_other, _opts, _depth), do: nil
 
-  # A malformed stack entry (unexpected shape from a caller-supplied
-  # `:stacktrace` option) skips just this one frame rather than raising and
-  # dropping the whole event -- `capture_exception/2` must stay fail-safe
-  # even when handed a garbage stacktrace.
-  defp build_frame(_unrecognized, _in_app_otp_apps), do: nil
-
-  defp format_mfa(module, function, arity) when is_atom(module) do
-    "#{inspect(module)}.#{function}/#{arity}"
+  defp extract_cause(exception, opts) do
+    case Keyword.fetch(opts, :cause) do
+      {:ok, cause} -> cause
+      :error -> nested_cause(exception)
+    end
   end
 
-  defp format_mfa(module, function, arity), do: "#{module}.#{function}/#{arity}"
-
-  defp in_app?(_module, []), do: nil
-
-  defp in_app?(module, in_app_otp_apps) do
-    Application.get_application(module) in in_app_otp_apps
+  defp nested_cause(exception) do
+    if match?(%{__exception__: true}, exception), do: Map.get(exception, :cause)
   end
 
   defp put_scope(item, opts) do
@@ -316,7 +317,6 @@ defmodule AlplusSDK.Envelope do
     |> Enum.map(&cap_text(to_string(&1), @max_fingerprint_chars))
   end
 
-  defp cap_text(nil, _max), do: nil
   defp cap_text(text, max) when is_binary(text), do: String.slice(text, 0, max)
 
   defp iso_now, do: DateTime.utc_now() |> DateTime.to_iso8601()

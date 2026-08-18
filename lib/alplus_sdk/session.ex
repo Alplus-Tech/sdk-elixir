@@ -1,32 +1,5 @@
 defmodule AlplusSDK.Session do
-  @moduledoc """
-  Request-scoped session-health tracker for AL+ Observe's crash-free
-  sessions metric (issue #12). One request = one session, Sentry
-  "request-mode" style: `AlplusSDK.Plug` opens it, this module accumulates
-  its outcome as the request runs, and `AlplusSDK.Plug` closes it when the
-  response is sent.
-
-  State lives in the process dictionary, exactly like `AlplusSDK.Scope`, for
-  the same reason: Cowboy/Bandit give each request its own process, so this
-  is the correct (and only) place request-local mutable state belongs
-  without threading an accumulator through every call site.
-
-  Three outcomes, in ascending severity, matching ARCHITECTURE.md's
-  decision #2 (Sentry-aligned):
-
-    * `:healthy` -- the request completed with no captured error.
-    * `:errored` -- the request captured a handled error (any
-      `AlplusSDK.capture_exception/2`/`capture_message/3` at level
-      `"error"`/`"fatal"`).
-    * `:crashed` -- the request's response was rendered from an UNHANDLED
-      exception. Only this state counts against crash-free sessions.
-
-  Severity only ever increases within one request: `mark_errored/0` is a
-  no-op once `mark_crashed/0` has run, so a handled-error capture made
-  while unwinding a crash (e.g. `AlplusSDK.Telemetry`'s own
-  `capture_exception` call for the crash itself) can never downgrade the
-  outcome back to `:errored`.
-  """
+  @moduledoc false
 
   @pdict_key :__alplus_sdk_session__
 
@@ -49,9 +22,6 @@ defmodule AlplusSDK.Session do
 
     Process.put(@pdict_key, session)
     session
-  rescue
-    _ ->
-      %{id: AlplusSDK.Id.generate_session_id(), status: :healthy, started_at: DateTime.utc_now()}
   end
 
   @doc "The current process's session, or `nil` if none was started."

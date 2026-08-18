@@ -1,17 +1,5 @@
 defmodule AlplusSDK.Telemetry do
-  @moduledoc """
-  Attaches a `:telemetry` handler for Phoenix's documented
-  `[:phoenix, :error_rendered]` event
-  (`deps/phoenix/lib/phoenix/endpoint/render_errors.ex`), so a request that
-  reaches `Phoenix.Endpoint.RenderErrors` is auto-captured without wrapping
-  every controller/router call site.
-
-  `[:phoenix, :error_rendered]` metadata carries `%{kind:, reason:, stacktrace:, status:}`
-  for every rendered error, including expected 404s -- this handler only
-  captures `status >= 500` (or a `kind`/`reason` combination Phoenix itself
-  wouldn't map to a 4xx), matching what a developer means by "unhandled
-  exception".
-  """
+  @moduledoc false
 
   alias AlplusSDK.Client
 
@@ -61,8 +49,6 @@ defmodule AlplusSDK.Telemetry do
     end
 
     :ok
-  rescue
-    _ -> :ok
   end
 
   defp capture?(%{status: status}) when is_integer(status), do: status >= 500

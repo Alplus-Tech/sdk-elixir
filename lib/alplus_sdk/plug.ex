@@ -1,55 +1,21 @@
 defmodule AlplusSDK.Plug do
   @moduledoc """
-  Resets `AlplusSDK.Scope` and opens a fresh `AlplusSDK.Session` (issue
-  #12) at the start of every request. Add it first, before any plug that
-  calls `AlplusSDK.Scope.set_user/1` etc, so a fresh request never inherits
-  scope or session state from a previous one:
+  Resets ambient scope and opens a crash-free session at the start of
+  every request. Add it first in the endpoint, before any plug that
+  calls `AlplusSDK.set_user/1`:
 
       plug AlplusSDK.Plug
-      plug MyAppWeb.AlplusScopePlug
 
-  Accepts one option, `:name` -- the `AlplusSDK.Client` process name
-  (default `AlplusSDK.Client`, same default as every other `AlplusSDK`
-  function), forwarded to `AlplusSDK.close_session/1`. Only needed for a
-  host running more than one named client.
+  `{AlplusSDK, []}` already attaches the Phoenix error handler. This plug
+  still has to sit in the pipeline so request order is visible.
 
-  Cowboy and Bandit already give each request its own Erlang process (so
-  the ambient scope/session in the process dictionary cannot leak between
-  requests under normal operation) -- this plug is a defensive reset for
-  the one case that would defeat that: a pooled/reused process (e.g. a
-  custom adapter, or a future change to the web server) carrying over
-  stale state from whatever request ran in it last.
+  Accepts `:name` when the host runs more than one named client.
 
-  ## Session lifecycle (issue #12)
+  The plug opens a session and closes it when the response is ready.
+  An unhandled 500 marks the session crashed via the Phoenix handler
+  attached at `start_link/1`.
 
-  This plug opens the session and, via `Plug.Conn.register_before_send/2`,
-  closes it (`AlplusSDK.close_session/1`) once the response is ready --
-  `:healthy` unless something during the request marked it `:errored`
-  (`AlplusSDK.capture_exception/2`/`capture_message/3` at level
-  `"error"`/`"fatal"`) or `:crashed`.
-
-  A plain `plug` entry cannot itself wrap the plugs that run AFTER it
-  (Plug/Phoenix compiles a pipeline into one sequential function, not
-  nested calls -- there is no `call/2` frame here left on the stack by the
-  time a downstream plug/controller raises), so this module cannot
-  `rescue` an unhandled exception directly the way
-  `sdks/ruby/lib/alplus/rack_middleware.rb`'s `Rack` middleware can. The
-  crash signal instead comes from `AlplusSDK.Telemetry.attach_phoenix/1`,
-  which observes Phoenix's own `[:phoenix, :error_rendered]` event
-  (fired, in-process, for exactly the unhandled-exception case) and calls
-  `AlplusSDK.mark_session_crashed/0` before this plug's `before_send`
-  callback runs. A host with no Phoenix (bare Plug) that wants `:crashed`
-  detection needs its own rescue calling `AlplusSDK.mark_session_crashed/0`
-  -- see that function's docs.
-
-  Duck-typed on `conn.assigns` (any struct/map with an `:assigns` key)
-  rather than `%Plug.Conn{}` directly, so `alplus_sdk` itself never depends
-  on the `:plug` library at compile time -- most hosts using this module
-  already depend on Phoenix/Plug, but the SDK core does not require it.
-  Attempting `register_before_send/2` on a bare `%{assigns: %{}}` test
-  double (no such callback registry) is a swallowed `UndefinedFunctionError`
-  -- the session is simply left open in that case, closed only by the next
-  `AlplusSDK.Session.start/0` reset.
+  Duck-typed on `conn.assigns`. This package does not depend on `:plug`.
   """
 
   @doc false

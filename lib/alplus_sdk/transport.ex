@@ -1,33 +1,5 @@
 defmodule AlplusSDK.Transport do
-  @moduledoc """
-  Wraps `Req` for the two requests this SDK makes (`POST /e/errors`,
-  `POST /h/:token`) behind a project-owned module so no other module in
-  this package calls `Req` directly.
-
-  Retries transient failures with jittered exponential backoff, honoring a
-  429's `Retry-After`, mirroring
-  `packages/sdk/src/core/observe/transport.ts`'s `postJsonWithRetries`
-  byte-identically (same default attempt count, backoff base/jitter, and
-  `Retry-After` cap) so a transient ingest blip behaves the same across
-  every AL+ SDK. A permanent 400/401/403/404 (malformed envelope, bad key,
-  unrecognized route) is dropped without retrying -- retrying a request the
-  server has already rejected as wrong cannot help.
-
-  `AlplusSDK.heartbeat/3` overrides `:max_attempts` and
-  `:honor_retry_after` (see that function's moduledoc): a heartbeat call is
-  synchronous on the caller's thread, so its retry budget is deliberately
-  smaller and never trusts a server-supplied `Retry-After` that could block
-  a cron job for up to 30s.
-
-  Every outcome (2xx, permanent 4xx, exhausted retries, timeout, connection
-  error) is swallowed here: Observe ingest and Monitor heartbeats are
-  best-effort telemetry, never allowed to raise into the host application
-  that depends on this SDK. Retries run entirely off the request path: the
-  caller of `post/2`/`request/3` already runs inside `AlplusSDK.Client`'s
-  own flush task (`POST /e/errors`) or the caller's own process for a
-  `heartbeat/2` call, never inside a `GenServer`'s main loop, so blocking
-  between attempts cannot back up an unrelated mailbox.
-  """
+  @moduledoc false
 
   require Logger
 

@@ -1,28 +1,5 @@
 defmodule AlplusSDK.LoggerHandler do
-  @moduledoc """
-  An OTP `:logger` handler (Erlang/OTP kernel logger, not a Logger
-  *backend*) that auto-captures crash reports as Observe exception events --
-  the "unhandled exceptions captured automatically" story, without wrapping
-  every call site.
-
-  `:proc_lib`/OTP crash reports (a `GenServer`, `Task`, or plain process
-  crashing) are logged by the kernel logger with `meta[:crash_reason]` set
-  to `{reason, stacktrace}` -- this is the same metadata key
-  `sentry_elixir`'s equivalent handler and Elixir's own `Logger.Translator`
-  rely on. Every other `:error`-and-above report (one without a crash
-  reason, e.g. a plain `Logger.error("...")` call) is captured as a
-  message, so a deliberate error log still reaches Observe.
-
-  ## Setup
-
-      :logger.add_handler(:alplus_sdk, AlplusSDK.LoggerHandler, %{
-        config: %{name: AlplusSDK.Client}
-      })
-
-  Add this once, typically in your `Application.start/2`, after starting
-  the `AlplusSDK.Client` child (order does not matter: capture calls are
-  no-ops until the client is running).
-  """
+  @moduledoc false
 
   alias AlplusSDK.Client
 
@@ -42,7 +19,7 @@ defmodule AlplusSDK.LoggerHandler do
         )
 
       _ ->
-        capture_plain_report(log_event, name)
+        handle_error_log(log_event, config, name)
     end
 
     :ok
@@ -87,6 +64,33 @@ defmodule AlplusSDK.LoggerHandler do
 
   def log(_log_event, _config), do: :ok
 
+  # A deliberate `Logger.error/1` is both a breadcrumb and, when this
+  # process has no exception in the post-error window, a standalone
+  # message event. After `capture_exception/2` it joins that event
+  # (`after_error`) instead of opening a second issue.
+  defp handle_error_log(log_event, config, name) do
+    handler_config = Map.get(config, :config) || %{}
+    message = extract_message(log_event)
+
+    if is_binary(message) and not String.starts_with?(message, "alplus_sdk") do
+      unless Map.get(handler_config, :logger_breadcrumbs) == false do
+        crumb = %{
+          category: "log",
+          message: message,
+          level: "error",
+          ts: DateTime.utc_now() |> DateTime.to_iso8601()
+        }
+
+        AlplusSDK.Scope.add_breadcrumb(crumb)
+        Client.notify_log_breadcrumb(name, crumb)
+      end
+
+      unless Client.has_pending_exception?(name) do
+        capture_plain_report(log_event, name)
+      end
+    end
+  end
+
   defp extract_message(%{msg: {:string, message}}) when is_binary(message), do: message
 
   defp extract_message(%{msg: {:string, message}}) when is_list(message),
@@ -114,8 +118,6 @@ defmodule AlplusSDK.LoggerHandler do
   defp capture_plain_report(%{msg: {format, args}}, name) when is_list(args) do
     AlplusSDK.capture_message(safe_format(format, args), "error", mechanism: "logger", name: name)
   end
-
-  defp capture_plain_report(_log_event, _name), do: :ok
 
   defp safe_format(format, args) do
     :io_lib.format(format, args) |> IO.iodata_to_binary()

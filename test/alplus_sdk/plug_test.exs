@@ -71,7 +71,8 @@ defmodule AlplusSDK.PlugTest do
          key: "alp_p_test_key_123",
          base_url: "http://localhost:#{bypass.port}",
          flush_interval_ms: 0,
-         batch_max_items: 1_000}
+         batch_max_items: 1_000,
+         integrations: []}
       )
 
       {:ok, bypass: bypass, name: name}

@@ -1,47 +1,5 @@
 defmodule AlplusSDK.Scope do
-  @moduledoc """
-  Request-scoped ambient scope: the server analog of the JS SDK's
-  `withScope`/browser scope (`packages/sdk/src/core/observe/scope.ts`),
-  adapted to a process-per-request server (Plug/Phoenix/Bandit/Cowboy each
-  give one request its own Erlang process) instead of a browser tab or a
-  Node `AsyncLocalStorage` context.
-
-  State lives in the calling process's dictionary, not a shared process:
-  `Process.get/2`/`Process.put/2` are the correct tool here, not a
-  `GenServer` or `ETS` table, because this state is scoped to exactly ONE
-  process (the request) and must never leak to a concurrent request -- a
-  shared process would need its own per-request key anyway, which is just
-  the process dictionary with extra steps.
-
-  Set once near the top of a request (typically from your own auth plug,
-  after `AlplusSDK.Plug` has reset any leftover state):
-
-      defmodule MyAppWeb.AlplusScopePlug do
-        def init(opts), do: opts
-
-        def call(conn, _opts) do
-          if user = conn.assigns[:current_user] do
-            AlplusSDK.Scope.set_user(%{id: to_string(user.id), email: user.email})
-          end
-
-          AlplusSDK.Scope.set_tag("org_id", conn.assigns.current_org_id)
-          conn
-        end
-      end
-
-      plug AlplusSDK.Plug
-      plug MyAppWeb.AlplusScopePlug
-
-  Every `AlplusSDK.capture_exception/2` and `AlplusSDK.capture_message/3`
-  call in that process picks up the ambient user/tags/contexts/breadcrumbs
-  automatically; an explicit `:user`/`:tags`/`:contexts`/`:breadcrumbs`
-  option on the capture call itself wins over the ambient value on a
-  per-key basis (an explicit `user: nil` clears the ambient user for that
-  one capture), mirroring `mergeScope` in `scope.ts`.
-
-  Every function here is fail-safe: a bad argument is swallowed rather than
-  raised into the caller, consistent with the rest of this package.
-  """
+  @moduledoc false
 
   @max_breadcrumbs 100
   @pdict_key :__alplus_sdk_scope__

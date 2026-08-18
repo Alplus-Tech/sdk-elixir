@@ -15,7 +15,8 @@ defmodule AlplusSDK.ClientTest do
       base_url: "http://localhost:1",
       flush_interval_ms: 0,
       batch_max_items: 1_000_000,
-      batch_max_bytes: 1_000_000_000
+      batch_max_bytes: 1_000_000_000,
+      integrations: []
     ]
 
     start_supervised!({Client, Keyword.merge(default_opts, opts)})

@@ -194,7 +194,8 @@ defmodule AlplusSDK.HeartbeatTest do
       {Client,
        key: "alp_p_test_key",
        base_url: "http://localhost:#{other_bypass.port}",
-       flush_interval_ms: 0}
+       flush_interval_ms: 0,
+       integrations: []}
     )
 
     test_pid = self()

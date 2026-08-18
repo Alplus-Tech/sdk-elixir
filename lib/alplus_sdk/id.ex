@@ -1,15 +1,5 @@
 defmodule AlplusSDK.Id do
-  @moduledoc """
-  Client-generated `err_`-prefixed UUIDv7 event ids for the `POST /e/errors`
-  wire protocol (ARCHITECTURE.md §8: dedup on the client `err_` UUIDv7 id).
-
-  Mirrors `packages/sdk/src/core/id.ts`'s hex-dashed UUIDv7 rendering
-  (`err_<8>-<4>-<4>-<4>-<12>`) rather than the monolith's own Crockford
-  base32 `Alplus.Id` format: this id is a wire-protocol idempotency key sent
-  to an HTTP endpoint, not an Ash resource primary key, and the ingest
-  parser (`Alplus.Observe.ErrorEnvelope`) only requires a 4-64 byte string —
-  it does not enforce a specific encoding.
-  """
+  @moduledoc false
 
   @doc "Generates a new `err_`-prefixed UUIDv7 event id."
   @spec generate() :: String.t()

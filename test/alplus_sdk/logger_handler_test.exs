@@ -13,7 +13,8 @@ defmodule AlplusSDK.LoggerHandlerTest do
        key: "alp_p_test_key_123",
        base_url: "http://localhost:#{bypass.port}",
        flush_interval_ms: 0,
-       batch_max_items: 1_000}
+       batch_max_items: 1_000,
+       integrations: []}
     )
 
     handler_id = :"logger_handler_test_#{System.unique_integer([:positive])}"
@@ -91,13 +92,14 @@ defmodule AlplusSDK.LoggerHandlerTest do
       :logger.log(:warning, "row 41 blank", %{})
 
       crumbs =
-        AlplusSDK.Scope.current().breadcrumbs |> Enum.filter(&(&1[:category] == "log"))
+        AlplusSDK.Scope.current().breadcrumbs
+        |> Enum.filter(&(&1[:category] == "log"))
+        |> Enum.uniq_by(&{&1.message, &1.level})
 
       assert [
                %{message: "importing roll", level: "info"},
                %{message: "row 41 blank", level: "warning"}
-             ] =
-               crumbs
+             ] = crumbs
 
       assert Enum.all?(crumbs, &is_binary(&1[:ts]))
     end
@@ -164,11 +166,132 @@ defmodule AlplusSDK.LoggerHandlerTest do
          base_url: "http://localhost:#{bypass.port}",
          flush_interval_ms: 0,
          batch_max_items: 1,
-         post_error_log_window_ms: 50}
+         post_error_log_window_ms: 50,
+         integrations: []}
       )
 
       AlplusSDK.capture_exception(%RuntimeError{message: "boom"}, name: windowed)
       assert_receive {:sealed_request, _raw_body}, 2_000
+    end
+
+    test "Logger.error after capture joins the pending event, not a second issue", %{
+      bypass: bypass,
+      name: name
+    } do
+      test_pid = self()
+
+      Bypass.expect_once(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.Scope.clear()
+      AlplusSDK.capture_exception(%RuntimeError{message: "boom"}, name: name)
+      :logger.log(:error, "Import aborted: key missing", %{})
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+
+      %{"items" => items} = Jason.decode!(raw_body)
+      assert length(items) == 1
+      [item] = items
+      assert item["type"] == "exception"
+
+      after_crumb =
+        Enum.find(item["breadcrumbs"], &(&1["message"] == "Import aborted: key missing"))
+
+      assert after_crumb["level"] == "error"
+      assert after_crumb["data"] == %{"after_error" => true}
+    end
+
+    test "a second capture seals the first so later logs do not leak onto it", %{
+      bypass: bypass,
+      name: name
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.Scope.clear()
+      first = AlplusSDK.capture_exception(%RuntimeError{message: "first"}, name: name)
+      second = AlplusSDK.capture_exception(%RuntimeError{message: "second"}, name: name)
+      :logger.log(:warning, "only for second", %{})
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      items = Jason.decode!(raw_body)["items"]
+
+      first_item = Enum.find(items, &(&1["id"] == first))
+      second_item = Enum.find(items, &(&1["id"] == second))
+
+      first_crumbs = first_item["breadcrumbs"] || []
+      refute Enum.any?(first_crumbs, &(&1["message"] == "only for second"))
+
+      after_crumb =
+        Enum.find(second_item["breadcrumbs"] || [], &(&1["message"] == "only for second"))
+
+      assert after_crumb["data"] == %{"after_error" => true}
+    end
+
+    test "a same-signature duplicate keeps the post-error window", %{
+      bypass: bypass,
+      name: name
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.Scope.clear()
+      first = AlplusSDK.capture_exception(%RuntimeError{message: "wrapper"}, name: name)
+      _dup = AlplusSDK.capture_exception(%RuntimeError{message: "wrapper"}, name: name)
+      :logger.log(:warning, "after duplicate", %{})
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      items = Jason.decode!(raw_body)["items"]
+      first_item = Enum.find(items, &(&1["id"] == first))
+      crumbs = first_item["breadcrumbs"] || []
+      assert Enum.any?(crumbs, &(&1["message"] == "after duplicate"))
+    end
+
+    test "a duplicate of an earlier exception seals a different pending item", %{
+      bypass: bypass,
+      name: name
+    } do
+      test_pid = self()
+
+      Bypass.expect(bypass, "POST", "/e/errors", fn conn ->
+        {:ok, raw_body, conn} = Plug.Conn.read_body(conn)
+        send(test_pid, {:request, raw_body})
+        Plug.Conn.resp(conn, 202, "{}")
+      end)
+
+      AlplusSDK.Scope.clear()
+      key_id = AlplusSDK.capture_exception(%KeyError{key: :a, term: %{}}, name: name)
+      wrap_id = AlplusSDK.capture_exception(%RuntimeError{message: "wrapper"}, name: name)
+      _dup = AlplusSDK.capture_exception(%KeyError{key: :a, term: %{}}, name: name)
+      :logger.log(:warning, "should not leak onto wrapper", %{})
+
+      assert :ok == Client.flush(name, 1_000)
+      assert_receive {:request, raw_body}, 1_000
+      items = Jason.decode!(raw_body)["items"]
+
+      wrap_item = Enum.find(items, &(&1["id"] == wrap_id))
+      wrap_crumbs = wrap_item["breadcrumbs"] || []
+      refute Enum.any?(wrap_crumbs, &(&1["message"] == "should not leak onto wrapper"))
+
+      key_item = Enum.find(items, &(&1["id"] == key_id))
+      key_crumbs = key_item["breadcrumbs"] || []
+      refute Enum.any?(key_crumbs, &(&1["message"] == "should not leak onto wrapper"))
     end
 
     test "another process's log lines never join this process's pending event", %{

@@ -1,31 +1,5 @@
 defmodule AlplusSDK.Dedup do
-  @moduledoc """
-  Pure dedup bookkeeping for `capture_exception/2`, mirroring the window and
-  size bound of `packages/sdk/src/core/observe/dedup.ts`'s `resolveDedupId`
-  so the same error captured twice within a short window reports once in
-  every AL+ SDK.
-
-  Deliberately kept as a plain data structure (a bounded map passed in and
-  returned, not a process of its own): JS keys its dedup cache on error
-  OBJECT IDENTITY via a `WeakMap` (falling back to a stringified value for
-  non-object throws) because JS values genuinely have reference identity.
-  Elixir exceptions are plain structs with no such identity -- two mentions
-  of "the same error" are two structurally-equal terms, not two references
-  to one object -- so this module always keys on a structural `signature/1`
-  instead. The window (2s) and the bound on the value-keyed fallback (50
-  entries) are copied byte-identical from `dedup.ts` even though the
-  identity-keyed half of that file has no Elixir equivalent.
-
-  The cache itself lives in `AlplusSDK.Client`'s `GenServer` state (a
-  process already supervised by the host app) rather than a dedicated
-  process of its own: JS's dedup is deliberately module-level, NOT part of
-  `ObserveState`, so it survives `init()` being called again -- Elixir has
-  no equivalent "reinitialize without restarting the process" operation
-  (restarting the supervised `Client` already clears everything, dedup
-  included), so tying it to the one process that already owns this SDK's
-  live state avoids introducing a second, unsupervised, always-on process
-  for a per-app cache this small.
-  """
+  @moduledoc false
 
   @window_ms 2_000
   @value_cache_max 50
@@ -51,8 +25,8 @@ defmodule AlplusSDK.Dedup do
 
   def signature(other), do: {:term, inspect(other)}
 
-  defp safe_message(exception) do
-    Exception.message(exception)
+  defp safe_message(%module{} = exception) do
+    module.message(exception)
   rescue
     _ -> nil
   end

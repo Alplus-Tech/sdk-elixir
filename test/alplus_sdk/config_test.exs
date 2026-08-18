@@ -50,11 +50,26 @@ defmodule AlplusSDK.ConfigTest do
     assert_raise ArgumentError, ~r/ALPLUS_KEY/, fn -> Config.new([]) end
   end
 
+  test "enabled?: false does not require a key" do
+    config = Config.new(enabled?: false)
+
+    assert config.key == ""
+    refute config.enabled?
+  end
+
+  test "test: true sets test? and defaults the post-error window to 0" do
+    config = Config.new(key: "alp_p_x", test: true)
+
+    assert config.test?
+    assert config.post_error_log_window_ms == 0
+  end
+
   test "defaults environment and base_url when nothing is configured" do
     config = Config.new(key: "alp_p_x")
 
     assert config.environment == "production"
     assert config.base_url == "https://ingest.alplus.dev"
+    assert config.context_lines == 3
   end
 
   describe "sampled?/1" do

@@ -20,7 +20,8 @@ defmodule AlplusSDKTest do
       # Deterministic tests: disable the idle timer, flush explicitly.
       flush_interval_ms: 0,
       batch_max_items: 100,
-      batch_max_bytes: 1_000_000
+      batch_max_bytes: 1_000_000,
+      integrations: []
     ]
 
     start_supervised!({Client, Keyword.merge(default_opts, opts)})

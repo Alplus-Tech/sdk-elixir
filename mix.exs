@@ -10,10 +10,16 @@ defmodule AlplusSDK.MixProject do
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
+      test_coverage: [summary: true, threshold: 99.9],
       deps: deps(),
-      description: "Elixir client for AL+ Observe error reporting (POST /e/errors).",
+      description: "Observe for Phoenix. Add a child and a plug.",
       package: package(),
-      docs: [source_url: @source_url]
+      docs: [
+        source_url: @source_url,
+        extras: ["README.md"],
+        main: "readme",
+        filter_modules: ~r/^AlplusSDK(\.Plug|\.Test)?$/
+      ]
     ]
   end
 
@@ -36,7 +42,8 @@ defmodule AlplusSDK.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url}
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md LICENSE)
     ]
   end
 end

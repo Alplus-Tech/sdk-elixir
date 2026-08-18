@@ -1,38 +1,28 @@
 defmodule AlplusSDK do
   @moduledoc """
-  Elixir client for AL+ Observe error reporting (`POST /e/errors`).
+  Elixir client for AL+ Observe (`POST /e/errors`) and Monitor heartbeats.
 
   ## Setup
 
-  Set `ALPLUS_KEY` (and, optionally, `ALPLUS_ENDPOINT`/`ALPLUS_ENVIRONMENT`/
-  `ALPLUS_RELEASE`) in the environment, then add a child to your
-  application's supervision tree with no explicit config:
+  Set `ALPLUS_KEY`. Add the child. Add the plug first in the endpoint.
 
       children = [
         {AlplusSDK, []},
-        ...
+        MyAppWeb.Endpoint
       ]
 
-  Or pass options explicitly (these win over both the env vars above and
-  `config.exs`):
+      # endpoint.ex
+      plug AlplusSDK.Plug
 
-      children = [
-        {AlplusSDK, key: System.fetch_env!("ALPLUS_KEY"), environment: "production", release: "..."},
-        ...
-      ]
+  `start_link/1` attaches the OTP logger handler and Phoenix
+  `[:phoenix, :error_rendered]` handler. Unhandled crashes are captured
+  without wrapping call sites.
 
-  Or configure via `config.exs`:
+  Identify the current user after the plug:
 
-      config :alplus_sdk, config: [
-        environment: "production",
-        sample_rate: 0.5
-      ]
+      AlplusSDK.set_user(%{id: user.id, email: user.email})
 
-  In `test`/`dev`, set `enabled?: false` (or `config :alplus_sdk, config: [enabled?: false]`)
-  to run in no-op mode: `capture_*` still returns an event id but never enqueues or
-  hits the network.
-
-  ## Usage
+  Capture a rescued exception when you handle it yourself:
 
       try do
         risky()
@@ -40,10 +30,15 @@ defmodule AlplusSDK do
         exception -> AlplusSDK.capture_exception(exception, stacktrace: __STACKTRACE__)
       end
 
-      AlplusSDK.capture_message("something worth a look", "warning")
+  Env vars: `ALPLUS_KEY`, `ALPLUS_ENDPOINT`, `ALPLUS_ENVIRONMENT`,
+  `ALPLUS_RELEASE`. Explicit `start_link/1` opts win.
 
-  Every public function here is fail-safe: it never raises into the caller,
-  even if the SDK was never started (an unstarted/absent client is a no-op).
+  In test, start with `test: true` and read `AlplusSDK.Test.events/0`.
+  Set `enabled?: false` to no-op capture without a key.
+
+  Every public function is fail-safe. An unstarted client is a no-op.
+  `start_link/1` still raises if the ingest key is missing and the SDK is
+  enabled. That is a boot error, not a request error.
   """
 
   alias AlplusSDK.{Client, Config, Dedup, Envelope, Scope, Session, Transport}
@@ -53,7 +48,12 @@ defmodule AlplusSDK do
 
   defdelegate child_spec(opts), to: Client
 
-  @doc "See `AlplusSDK.Client.start_link/1`."
+  @doc """
+  Starts the client. Attach this as `{AlplusSDK, []}` in the host supervisor.
+
+  Default integrations are `:logger` and `:phoenix`. Pass
+  `integrations: []` to skip them.
+  """
   defdelegate start_link(opts), to: Client
 
   @doc """
@@ -64,12 +64,15 @@ defmodule AlplusSDK do
   Options:
 
     * `:stacktrace` - the `__STACKTRACE__` list (default `[]`)
+    * `:cause` - the inner exception of a wrap-and-reraise (Elixir has no
+      `Exception.cause/1` on 1.15–1.19). Walked into `exception.cause`.
+    * `:cause_stacktrace` - `__STACKTRACE__` captured at the inner rescue
     * `:level` - `"fatal" | "error" | "warning" | "info"` (default `"error"`)
     * `:mechanism` - free-text capture source (default `"generic"`)
     * `:tags`, `:contexts`, `:context`, `:breadcrumbs`, `:fingerprint`, `:user` - scope
       overrides; `:context` is arbitrary structured data folded into
       `contexts["extra"]`. Each merges with (and wins over, per-key) the
-      ambient `AlplusSDK.Scope` for the calling process.
+      ambient scope for the calling process (`set_user/1` and friends).
     * `:name` - client process name (default `AlplusSDK.Client`)
 
   Returns the client-generated `err_` event id synchronously, always --
@@ -99,6 +102,7 @@ defmodule AlplusSDK do
           if Config.sampled?(config) do
             case resolve_dedup(name, exception, id) do
               {:duplicate, existing_id} ->
+                Client.note_duplicate_capture(name, existing_id)
                 existing_id
 
               {:fresh, id} ->
@@ -111,9 +115,14 @@ defmodule AlplusSDK do
                     |> Keyword.put_new(:environment, config.environment)
                     |> Keyword.put_new(:release, config.release)
                     |> Keyword.put_new(:in_app_otp_apps, config.in_app_otp_apps)
+                    |> Keyword.put_new(:context_lines, config.context_lines)
                   )
 
-                Client.enqueue(name, item)
+                case apply_before_send(config, item) do
+                  nil -> :ok
+                  item -> Client.enqueue(name, item)
+                end
+
                 id
             end
           else
@@ -155,7 +164,10 @@ defmodule AlplusSDK do
                 |> Keyword.put_new(:release, config.release)
               )
 
-            Client.enqueue(name, item)
+            case apply_before_send(config, item) do
+              nil -> :ok
+              item -> Client.enqueue(name, item)
+            end
           end
 
         :not_running ->
@@ -168,17 +180,7 @@ defmodule AlplusSDK do
     id
   end
 
-  @doc """
-  Closes the current process's request-scoped session (issue #12), if one
-  was started (see `AlplusSDK.Plug`): builds the wire item from
-  `AlplusSDK.Session.current/0` and enqueues it for batched delivery to
-  `POST /e/sessions`, then clears the session so a leftover session on a
-  reused/pooled process can never bleed into whatever runs in it next.
-
-  A no-op if no session was started or the client isn't running. Never
-  raises. Not typically called directly -- `AlplusSDK.Plug` calls this from
-  a `Plug.Conn` `before_send` callback once the response is ready.
-  """
+  @doc false
   @spec close_session(keyword()) :: :ok
   def close_session(opts \\ []) do
     case Session.current() do
@@ -210,13 +212,7 @@ defmodule AlplusSDK do
     :ok
   end
 
-  @doc """
-  Marks the current process's request-scoped session `:crashed` (issue
-  #12) -- the ONLY session outcome that counts against crash-free sessions
-  (ARCHITECTURE.md decision #2: unhandled/fatal only). Called by
-  `AlplusSDK.Telemetry` when Phoenix renders a `>= 500` response from an
-  unhandled exception; never downgrades an already-`:crashed` session.
-  """
+  @doc false
   @spec mark_session_crashed() :: :ok
   def mark_session_crashed, do: Session.mark_crashed()
 
@@ -262,7 +258,7 @@ defmodule AlplusSDK do
   is not required (a cron job that only reports liveness, with no error
   reporting configured, is a normal use of this function).
 
-  `transport_opts` forwards additional options to `AlplusSDK.Transport.request/3`
+  `transport_opts` forwards additional options to the HTTP adapter
   (namely `:sleep_fun`, for this package's own tests); not part of the
   documented public contract.
 
@@ -298,6 +294,40 @@ defmodule AlplusSDK do
     end
 
     :ok
+  end
+
+  @doc """
+  Sets the ambient user for this process. Call after `AlplusSDK.Plug`.
+
+  `user` is a map with `:id` or `"id"` and optional email. `nil` clears it.
+  Never raises.
+  """
+  @spec set_user(map() | nil) :: :ok
+  def set_user(user) do
+    Scope.set_user(user)
+  end
+
+  @doc "Sets one ambient tag on this process. Never raises."
+  @spec set_tag(term(), term()) :: :ok
+  def set_tag(key, value) do
+    Scope.set_tag(key, value)
+  end
+
+  @doc "Sets one named ambient context on this process. Never raises."
+  @spec set_context(term(), map()) :: :ok
+  def set_context(name, data) do
+    Scope.set_context(name, data)
+  end
+
+  @doc """
+  Appends one breadcrumb to this process's ambient trail.
+
+  Accepts a map with `:message` / `:category` / `:level` / `:data`.
+  Never raises.
+  """
+  @spec add_breadcrumb(map()) :: :ok
+  def add_breadcrumb(breadcrumb) do
+    Scope.add_breadcrumb(breadcrumb)
   end
 
   defp heartbeat_state_param(state) when state in [:start, :finish, :fail],
@@ -343,8 +373,19 @@ defmodule AlplusSDK do
 
   defp resolve_dedup(name, exception, fresh_id) do
     Client.resolve_dedup(name, Dedup.signature(exception), fresh_id)
-  catch
-    :exit, _ -> {:fresh, fresh_id}
+  end
+
+  defp apply_before_send(%{before_send: nil}, item), do: item
+
+  defp apply_before_send(%{before_send: fun}, item) when is_function(fun, 1) do
+    case fun.(item) do
+      nil -> nil
+      false -> nil
+      updated when is_map(updated) -> updated
+      _ -> item
+    end
+  rescue
+    _ -> item
   end
 
   # Merges the calling process's ambient `AlplusSDK.Scope` with per-call
