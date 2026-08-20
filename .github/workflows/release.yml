@@ -1,10 +1,11 @@
 # Release for alplus_sdk to Hex, destined for Alplus-Tech/sdk-elixir.
 # Manual or tag-driven only; a product change can never publish an SDK.
 #
-# Publishing prefers Hex trusted publishing (OIDC). If configured on the
-# alplus_sdk Hex package, drop HEX_API_KEY and let `mix hex.publish` use the
-# OIDC token. Otherwise set HEX_API_KEY as a repository secret in
-# Alplus-Tech/sdk-elixir.
+# Hex has no trusted publishing (OIDC) yet: `mix help hex.publish` in Hex 2.5.1
+# offers no OIDC flow, and hex.pm lists it as roadmap only. Publishing therefore
+# needs a write-scoped API key. Generate it on the Hex dashboard keys page with
+# API "Write" permission, then set it as the HEX_API_KEY repository secret in
+# Alplus-Tech/sdk-elixir. Move to OIDC when Hex ships it.
 name: Release
 
 on:
@@ -14,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Hex trusted publishing (OIDC)
 
 env:
   OTP_VERSION: "27.2"
