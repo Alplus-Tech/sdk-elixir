@@ -1,4 +1,4 @@
-# CI for the Elixir SDK (alplus_sdk), destined for Alplus-Tech/sdk-elixir.
+# CI for the Elixir SDK (postdeploy_sdk), destined for Alplus-Tech/sdk-elixir.
 # Lives inside sdks/elixir so it becomes the repo-root workflow after the split
 # (issue #26). GitHub ignores it in the monorepo (only repo-root workflows run).
 #
@@ -19,7 +19,7 @@ concurrency:
 env:
   OTP_VERSION: "27.2"
   ELIXIR_VERSION: "1.18.1"
-  CONTRACT_REF: contract-v1.0.0
+  CONTRACT_REF: contract-v1.1.0
 
 jobs:
   test:

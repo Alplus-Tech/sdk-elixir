@@ -1,4 +1,4 @@
-# Release for alplus_sdk to Hex, destined for Alplus-Tech/sdk-elixir.
+# Release for postdeploy_sdk to Hex, destined for Alplus-Tech/sdk-elixir.
 # Manual or tag-driven only; a product change can never publish an SDK.
 #
 # Hex has no trusted publishing (OIDC) yet: `mix help hex.publish` in Hex 2.5.1
@@ -19,7 +19,7 @@ permissions:
 env:
   OTP_VERSION: "27.2"
   ELIXIR_VERSION: "1.18.1"
-  CONTRACT_REF: contract-v1.0.0
+  CONTRACT_REF: contract-v1.1.0
 
 jobs:
   publish:

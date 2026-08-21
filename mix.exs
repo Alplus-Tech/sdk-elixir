@@ -1,24 +1,24 @@
-defmodule AlplusSDK.MixProject do
+defmodule PostDeploy.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/Alplus-Tech/sdk-elixir"
 
   def project do
     [
-      app: :alplus_sdk,
+      app: :postdeploy_sdk,
       version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       test_coverage: [summary: true, threshold: 99.9],
       deps: deps(),
-      description: "Observe for Phoenix. Add a child and a plug.",
+      description: "PostDeploy instrumentation for Elixir and Phoenix.",
       package: package(),
       docs: [
         source_url: @source_url,
         extras: ["README.md"],
         main: "readme",
-        filter_modules: ~r/^AlplusSDK(\.Plug|\.Test)?$/
+        filter_modules: ~r/^PostDeploy(\.Plug|\.Test)?$/
       ]
     ]
   end

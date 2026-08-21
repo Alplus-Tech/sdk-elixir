@@ -1,27 +1,27 @@
-# alplus_sdk
+# postdeploy_sdk
 
-Error reporting for [AL+ Observe](https://alplus.dev). Elixir and Phoenix.
+Error reporting for [PostDeploy Observe](https://postdeploy.dev). Elixir and Phoenix.
 
 ## Install
 
 ```elixir
 # mix.exs
-{:alplus_sdk, "~> 0.1"}
+{:postdeploy_sdk, "~> 0.1"}
 ```
 
-Set `ALPLUS_KEY` (an ingest key with the `ingest` scope).
+Set `POSTDEPLOY_API_KEY` (an ingest key with the `ingest` scope).
 
 ## Phoenix
 
 ```elixir
 # application.ex
 children = [
-  {AlplusSDK, []},
+  {PostDeploy, []},
   MyAppWeb.Endpoint
 ]
 
 # endpoint.ex, first plug
-plug AlplusSDK.Plug
+plug PostDeploy.Plug
 ```
 
 `start_link/1` attaches the OTP logger handler and Phoenix
@@ -31,8 +31,8 @@ The plug opens a crash-free session per request.
 Identify the current user after the plug:
 
 ```elixir
-AlplusSDK.set_user(%{id: user.id, email: user.email})
-AlplusSDK.set_tag("org_id", org.id)
+PostDeploy.set_user(%{id: user.id, email: user.email})
+PostDeploy.set_tag("org_id", org.id)
 ```
 
 ## Capture
@@ -42,33 +42,33 @@ try do
   risky()
 rescue
   exception ->
-    AlplusSDK.capture_exception(exception, stacktrace: __STACKTRACE__)
+    PostDeploy.capture_exception(exception, stacktrace: __STACKTRACE__)
 end
 
-AlplusSDK.capture_message("low disk space", "warning")
+PostDeploy.capture_message("low disk space", "warning")
 ```
 
-Both calls return an `err_` event id and never raise, even if AL+ is
+Both calls return an `err_` event id and never raise, even if PostDeploy is
 unreachable.
 
 ## Heartbeat
 
 ```elixir
-AlplusSDK.heartbeat(token)
-AlplusSDK.heartbeat(token, :fail)
+PostDeploy.heartbeat(token)
+PostDeploy.heartbeat(token, :fail)
 ```
 
 Token is the auth. A running client is not required.
 
 ## Config
 
-Env vars: `ALPLUS_KEY`, `ALPLUS_ENDPOINT`, `ALPLUS_ENVIRONMENT`,
-`ALPLUS_RELEASE`.
+Env vars: `POSTDEPLOY_API_KEY`, `POSTDEPLOY_INGEST_URL`, `POSTDEPLOY_ENVIRONMENT`,
+`POSTDEPLOY_RELEASE`.
 
 Explicit `start_link/1` opts win. `config.exs` is the middle layer:
 
 ```elixir
-config :alplus_sdk, config: [
+config :postdeploy_sdk, config: [
   environment: "production",
   sample_rate: 0.5,
   before_send: &MyApp.Observe.scrub/1
@@ -83,12 +83,12 @@ Set `enabled?: false` to no-op capture. A missing key is then allowed.
 ## Tests
 
 ```elixir
-start_supervised!({AlplusSDK, key: "alp_test", test: true})
+start_supervised!({PostDeploy, key: "alp_test", test: true})
 
-AlplusSDK.capture_exception(%RuntimeError{message: "boom"})
-AlplusSDK.flush()
+PostDeploy.capture_exception(%RuntimeError{message: "boom"})
+PostDeploy.flush()
 
-[item] = AlplusSDK.Test.events()
+[item] = PostDeploy.Test.events()
 assert item["exception"]["value"] == "boom"
 ```
 
