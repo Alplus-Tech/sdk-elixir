@@ -28,7 +28,7 @@ defmodule AlplusSDK.ContractTest do
 
   alias AlplusSDK.Envelope
 
-  @contract_version "1.0.0"
+  @contract_version "1.1.0"
   @non_deterministic_keys ~w(id timestamp started_at duration_ms)
 
   # The golden contract is owned by the AL+ product (Alplus-Tech/alplus) and
