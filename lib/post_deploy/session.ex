@@ -7,8 +7,7 @@ defmodule PostDeploy.Session do
 
   @type t :: %{
           id: String.t(),
-          status: status(),
-          started_at: DateTime.t()
+          status: status()
         }
 
   @doc "Starts a fresh session for the current process, discarding any previous one."
@@ -16,8 +15,7 @@ defmodule PostDeploy.Session do
   def start do
     session = %{
       id: PostDeploy.Id.generate_session_id(),
-      status: :healthy,
-      started_at: DateTime.utc_now()
+      status: :healthy
     }
 
     Process.put(@pdict_key, session)

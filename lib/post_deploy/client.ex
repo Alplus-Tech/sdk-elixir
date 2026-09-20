@@ -463,7 +463,7 @@ defmodule PostDeploy.Client do
   end
 
   defp send_batch(config, items, name) do
-    envelope = Envelope.build(config, items)
+    envelope = Envelope.build(config, Enum.map(items, &PostDeploy.Scrubber.scrub/1))
     body = Jason.encode!(envelope)
 
     if byte_size(body) > Config.max_envelope_bytes() do
@@ -486,7 +486,7 @@ defmodule PostDeploy.Client do
   end
 
   defp send_session_batch(config, items, name) do
-    envelope = Envelope.build(config, items)
+    envelope = Envelope.build(config, Enum.map(items, &PostDeploy.Scrubber.scrub/1))
     body = Jason.encode!(envelope)
 
     if byte_size(body) > Config.max_envelope_bytes() do

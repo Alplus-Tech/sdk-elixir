@@ -77,7 +77,8 @@ defmodule PostDeploy.Config do
     key =
       Keyword.get(merged, :key) || System.get_env("POSTDEPLOY_API_KEY") ||
         if enabled? do
-          raise ArgumentError, "PostDeploy requires a :key (ingest key) or POSTDEPLOY_API_KEY env var"
+          raise ArgumentError,
+                "PostDeploy requires a :key (ingest key) or POSTDEPLOY_API_KEY env var"
         else
           ""
         end
@@ -89,7 +90,8 @@ defmodule PostDeploy.Config do
     release = Keyword.get(merged, :release) || System.get_env("POSTDEPLOY_RELEASE")
 
     base_url =
-      Keyword.get(merged, :base_url) || System.get_env("POSTDEPLOY_INGEST_URL") || @default_base_url
+      Keyword.get(merged, :base_url) || System.get_env("POSTDEPLOY_INGEST_URL") ||
+        @default_base_url
 
     window = Keyword.get(merged, :post_error_log_window_ms)
     window = if is_nil(window) and test?, do: 0, else: window

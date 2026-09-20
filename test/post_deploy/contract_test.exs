@@ -28,8 +28,18 @@ defmodule PostDeploy.ContractTest do
 
   alias PostDeploy.Envelope
 
-  @contract_version "1.1.0"
-  @non_deterministic_keys ~w(id timestamp started_at duration_ms)
+  @contract_version "2.0.0"
+  @non_deterministic_keys ~w(id timestamp)
+  @expected_digests %{
+    "exception_item.json" =>
+      "sha256:a970a83c0b7f8a1d74b8602afd886941634c711e600e41e2dc6ea579f868a380",
+    "message_item.json" =>
+      "sha256:0f14c4f20605fed9a844646905047835033a7c6ade38fc1cb1d7da0158362e8f",
+    "measure_event.json" =>
+      "sha256:132914d7468c8909baad2509bfb17de8ee30d585259c783a72d21f9446b6a483",
+    "session_item.json" =>
+      "sha256:3bfe1d1458a03a3ced1b725c86d2a9aabbd57129f7aeb6a529d2d923ede8ec40"
+  }
 
   # The golden contract is owned by the PostDeploy product (Alplus-Tech/alplus) and
   # consumed as an explicit, immutable input (issue #26): ALPLUS_CONTRACT_DIR
@@ -53,11 +63,25 @@ defmodule PostDeploy.ContractTest do
   defp verify_manifest!(dir) do
     manifest = dir |> Path.join("manifest.json") |> File.read!() |> Jason.decode!()
 
-    unless manifest["version"] == @contract_version do
-      raise "contract version mismatch: pinned #{@contract_version}, got #{manifest["version"]}"
+    unless manifest["version"] == @contract_version and
+             manifest["items"] == @expected_digests do
+      raise "contract version or independently pinned digest mismatch"
     end
 
-    Enum.each(manifest["items"], fn {name, expected} ->
+    checksum_file =
+      dir
+      |> Path.join("SHA256SUMS")
+      |> File.stream!()
+      |> Map.new(fn line ->
+        [digest, name] = String.split(String.trim(line), ~r/\s+/, parts: 2)
+        {name, "sha256:" <> digest}
+      end)
+
+    Enum.each(@expected_digests, fn {name, expected} ->
+      unless checksum_file[name] == expected do
+        raise "contract SHA256SUMS mismatch for #{name}"
+      end
+
       digest = dir |> Path.join(name) |> File.read!() |> then(&:crypto.hash(:sha256, &1))
       actual = "sha256:" <> Base.encode16(digest, case: :lower)
 
@@ -145,7 +169,7 @@ defmodule PostDeploy.ContractTest do
   end
 
   test "the session item matches the golden" do
-    session = %{id: "ses_ignored", status: :crashed, started_at: DateTime.utc_now()}
+    session = %{id: "ses_ignored", status: :crashed}
 
     item =
       Envelope.session_item(session, release: "1.0.0", environment: "test")

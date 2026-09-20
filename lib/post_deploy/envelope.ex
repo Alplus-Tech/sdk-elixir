@@ -111,12 +111,10 @@ defmodule PostDeploy.Envelope do
   raw) -- matching `Alplus.Observe.SessionEnvelope`, the server parser.
   """
   @spec session_item(PostDeploy.Session.t(), keyword()) :: map()
-  def session_item(%{id: id, status: status, started_at: started_at}, opts \\ []) do
+  def session_item(%{id: id, status: status}, opts \\ []) do
     %{
       id: id,
       status: Atom.to_string(status),
-      started_at: DateTime.to_iso8601(started_at),
-      duration_ms: DateTime.diff(DateTime.utc_now(), started_at, :millisecond),
       release: Keyword.get(opts, :release),
       environment: Keyword.get(opts, :environment)
     }

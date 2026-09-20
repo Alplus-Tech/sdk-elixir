@@ -66,6 +66,32 @@ defmodule PostDeploy.PublishedInterfaceTest do
     assert item["tags"]["via"] == "before_send"
   end
 
+  test "mandatory scrub runs after before_send mutations" do
+    name =
+      start_test_client(
+        before_send: fn item ->
+          Map.put(item, :contexts, %{
+            "request" => %{
+              "Password" => "secret",
+              "nested" => [%{"api_key" => "key"}, %{"safe" => "visible"}]
+            }
+          })
+        end
+      )
+
+    PostDeploy.capture_exception(%RuntimeError{message: "scrub"}, name: name)
+    assert :ok == PostDeploy.flush(name: name, timeout: 1_000)
+
+    [item] = Test.events(name)
+
+    assert item["contexts"] == %{
+             "request" => %{
+               "Password" => "[FILTERED]",
+               "nested" => [%{"api_key" => "[FILTERED]"}, %{"safe" => "visible"}]
+             }
+           }
+  end
+
   test "a raising before_send still sends the original item" do
     name = start_test_client(before_send: fn _item -> raise "nope" end)
 

@@ -43,8 +43,8 @@ defmodule PostDeploy do
 
   alias PostDeploy.{Client, Config, Dedup, Envelope, Scope, Session, Transport}
 
-  @type name :: Client.name()
-  @type heartbeat_state :: :start | :finish | :fail
+  @heartbeat_retryable_statuses [408, 429 | Enum.to_list(500..599)]
+  @type heartbeat_state :: :start | :finish | :fail | String.t()
 
   defdelegate child_spec(opts), to: Client
 
@@ -237,30 +237,21 @@ defmodule PostDeploy do
 
   A single `ping_id` (a bare UUIDv4, `PostDeploy.Id.generate_ping_id/0`) is
   generated once per call and reused across every retry attempt as
-  `?ping_id=`, matching JS's `heartbeat.ts`: Monitor's ingest dedups
-  retried pings on this id, so a retried `fail`/`finish` is recorded once,
-  not as two runs.
+  `?ping_id=`. The server deduplicates it per monitor for 24 hours.
 
-  Reuses `PostDeploy.Transport`'s retry/backoff, but with a smaller,
-  heartbeat-specific budget (`:max_attempts` 2, `:honor_retry_after`
-  `false`) instead of Observe ingest's default 3 attempts honoring a
-  `Retry-After` up to 30s: this function runs synchronously on the
-  caller's own thread (correct for a cron/script that must report before
-  it exits), so it blocks the caller briefly (worst case: one ~500ms-1.5s
-  jittered backoff) rather than risking a long server-supplied delay.
+  Makes at most two attempts. It retries transport failures, `408`, `429`, and
+  `5xx` responses only. Each attempt has a five-second receive timeout.
+  A delta-seconds `Retry-After` is capped at two seconds. Other retries use
+  jittered backoff around 500ms. Debug diagnostics redact the heartbeat token.
 
   The base URL resolves the same way `PostDeploy.Config` does -- a running
-  named `PostDeploy.Client`'s own `start_link/1` `:base_url` first (so a
-  self-hosted ingest endpoint configured only via `start_link` opts, not
-  `Application.get_env/3` or `POSTDEPLOY_INGEST_URL`, is still honored), then
-  `Application.get_env(:postdeploy_sdk, :config, base_url: ...)`, then
-  `POSTDEPLOY_INGEST_URL`, then the default -- but a running `PostDeploy.Client`
-  is not required (a cron job that only reports liveness, with no error
-  reporting configured, is a normal use of this function).
+  named `PostDeploy.Client`'s own `start_link/1` `:base_url` first (so a self-
+  hosted ingest endpoint configured only via `start_link` opts is still honored),
+  then `Application.get_env(:postdeploy_sdk, :config, base_url: ...)`, then
+  `POSTDEPLOY_INGEST_URL`, then the default. A running client is not required.
 
-  `transport_opts` forwards additional options to the HTTP adapter
-  (namely `:sleep_fun`, for this package's own tests); not part of the
-  documented public contract.
+  `transport_opts` forwards additional options to the HTTP adapter, namely
+  `:sleep_fun` for this package's tests. It is not part of the public contract.
 
   Fail-safe and off the request path: always returns `:ok`, never raises,
   even if `token` isn't a binary.
@@ -269,6 +260,7 @@ defmodule PostDeploy do
   def heartbeat(token, state \\ :finish, transport_opts \\ []) do
     try do
       ping_id = PostDeploy.Id.generate_ping_id()
+      token = if is_binary(token), do: token, else: inspect(token)
 
       url =
         heartbeat_base_url() <>
@@ -282,9 +274,13 @@ defmodule PostDeploy do
         Keyword.merge(
           [
             receive_timeout: 5_000,
+            debug: heartbeat_debug(),
             debug_label: "heartbeat",
+            redact_token: token,
             max_attempts: 2,
-            honor_retry_after: false
+            max_retry_after_ms: 2_000,
+            retryable_statuses: @heartbeat_retryable_statuses,
+            honor_retry_after: true
           ],
           transport_opts
         )
@@ -297,8 +293,6 @@ defmodule PostDeploy do
   end
 
   @doc """
-  Sets the ambient user for this process. Call after `PostDeploy.Plug`.
-
   `user` is a map with `:id` or `"id"` and optional email. `nil` clears it.
   Never raises.
   """
@@ -352,6 +346,13 @@ defmodule PostDeploy do
 
   defp stringify_message(message) when is_binary(message), do: message
   defp stringify_message(message), do: inspect(message)
+
+  defp heartbeat_debug do
+    case fetch_config([]) do
+      {:ok, _name, config} -> config.debug == true
+      :not_running -> false
+    end
+  end
 
   defp fetch_config(opts) do
     name = Keyword.get(opts, :name, Client)

@@ -19,19 +19,27 @@ permissions:
 env:
   OTP_VERSION: "27.2"
   ELIXIR_VERSION: "1.18.1"
-  CONTRACT_REF: contract-v1.1.0
+  CONTRACT_COMMIT: ${{ vars.CONTRACT_V2_COMMIT }}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate immutable contract commit
+        shell: bash
+        run: |
+          if [[ ! "$CONTRACT_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::CONTRACT_V2_COMMIT must be a full 40-hex product commit SHA"
+            exit 1
+          fi
+
 
       - name: Check out the pinned contract
         uses: actions/checkout@v4
         with:
           repository: Alplus-Tech/alplus
-          ref: ${{ env.CONTRACT_REF }}
+          ref: ${{ env.CONTRACT_COMMIT }}
           token: ${{ secrets.CONTRACT_REPO_TOKEN }}
           sparse-checkout: sdks/contract
           path: .contract-src

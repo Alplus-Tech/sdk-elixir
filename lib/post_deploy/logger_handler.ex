@@ -116,7 +116,10 @@ defmodule PostDeploy.LoggerHandler do
   end
 
   defp capture_plain_report(%{msg: {format, args}}, name) when is_list(args) do
-    PostDeploy.capture_message(safe_format(format, args), "error", mechanism: "logger", name: name)
+    PostDeploy.capture_message(safe_format(format, args), "error",
+      mechanism: "logger",
+      name: name
+    )
   end
 
   defp safe_format(format, args) do

@@ -2,11 +2,13 @@
 
 Error reporting for [PostDeploy Observe](https://postdeploy.dev). Elixir and Phoenix.
 
+Setup guide: [Elixir and Phoenix error tracking](https://postdeploy.dev/docs/observe/elixir).
+
 ## Install
 
 ```elixir
 # mix.exs
-{:postdeploy_sdk, "~> 0.1"}
+{:postdeploy_sdk, "~> 0.2"}
 ```
 
 Set `POSTDEPLOY_API_KEY` (an ingest key with the `ingest` scope).
@@ -58,7 +60,12 @@ PostDeploy.heartbeat(token)
 PostDeploy.heartbeat(token, :fail)
 ```
 
-Token is the auth. A running client is not required.
+Heartbeat calls never raise. Each call makes at most two attempts and reuses
+one UUIDv4 `ping_id` across retries. The server deduplicates a supplied ID per
+monitor for 24 hours. Transport failures, `408`, `429`, and `5xx` responses
+retry only. Each attempt has a five-second timeout. Delta-seconds
+`Retry-After` is capped at two seconds; other retries use jittered backoff
+around 500ms. Diagnostics redact the full heartbeat token.
 
 ## Config
 

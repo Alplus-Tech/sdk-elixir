@@ -139,9 +139,7 @@ defmodule PostDeploy.HeartbeatTest do
     refute_receive {:attempt, 3}, 100
   end
 
-  test "a 429 Retry-After is ignored (never blocks on a long server-supplied delay)", %{
-    bypass: bypass
-  } do
+  test "a 429 Retry-After is honored but capped at two seconds", %{bypass: bypass} do
     test_pid = self()
     counter = start_supervised!({Agent, fn -> 0 end})
 
@@ -154,7 +152,7 @@ defmodule PostDeploy.HeartbeatTest do
 
       conn
       |> Plug.Conn.put_resp_header("retry-after", "25")
-      |> Plug.Conn.resp(429, "slow down")
+      |> Plug.Conn.resp(if(count == 1, do: 429, else: 202), "")
     end)
 
     sleep_fun = fn ms ->
@@ -167,7 +165,77 @@ defmodule PostDeploy.HeartbeatTest do
     assert_receive {:attempt, 1}, 1_000
     assert_receive {:attempt, 2}, 1_000
     assert [delay] = Agent.get(delays, & &1)
-    assert delay < 25_000
+    assert delay == 2_000
+  end
+
+  test "a whole-number Retry-After is honored", %{bypass: bypass} do
+    test_pid = self()
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    Bypass.expect(bypass, "POST", "/h/hb_test_token", fn conn ->
+      count = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+
+      if count == 1 do
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "1")
+        |> Plug.Conn.resp(429, "")
+      else
+        send(test_pid, :retried)
+        Plug.Conn.resp(conn, 202, "")
+      end
+    end)
+
+    sleep_fun = fn milliseconds ->
+      send(test_pid, {:delay, milliseconds})
+      :ok
+    end
+
+    assert :ok == PostDeploy.heartbeat("hb_test_token", :finish, sleep_fun: sleep_fun)
+    assert_receive {:delay, 1_000}, 1_000
+    assert_receive :retried, 1_000
+  end
+
+  test "fractional and HTTP-date Retry-After values use ordinary backoff", %{bypass: bypass} do
+    test_pid = self()
+    counter = start_supervised!({Agent, fn -> 0 end})
+
+    for retry_after <- ["1.5", "Wed, 21 Oct 2015 07:28:00 GMT"] do
+      Agent.update(counter, fn _ -> 0 end)
+
+      Bypass.expect(bypass, "POST", "/h/hb_test_token", fn conn ->
+        count = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
+
+        if count == 1 do
+          conn
+          |> Plug.Conn.put_resp_header("retry-after", retry_after)
+          |> Plug.Conn.resp(429, "")
+        else
+          Plug.Conn.resp(conn, 202, "")
+        end
+      end)
+
+      sleep_fun = fn milliseconds ->
+        send(test_pid, {:delay, milliseconds})
+        :ok
+      end
+
+      assert :ok == PostDeploy.heartbeat("hb_test_token", :finish, sleep_fun: sleep_fun)
+      assert_receive {:delay, milliseconds}, 1_000
+      assert milliseconds in 250..750
+    end
+  end
+
+  test "a non-transient response is not retried", %{bypass: bypass} do
+    test_pid = self()
+
+    Bypass.expect_once(bypass, "POST", "/h/hb_test_token", fn conn ->
+      send(test_pid, :attempt)
+      Plug.Conn.resp(conn, 409, "conflict")
+    end)
+
+    assert :ok == PostDeploy.heartbeat("hb_test_token", :finish, no_sleep())
+    assert_receive :attempt, 1_000
+    refute_receive :attempt, 100
   end
 
   test "an unrecognized token (404) is swallowed, not raised", %{bypass: bypass} do

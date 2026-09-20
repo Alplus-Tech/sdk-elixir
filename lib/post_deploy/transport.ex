@@ -16,6 +16,9 @@ defmodule PostDeploy.Transport do
            label: String.t(),
            max_attempts: pos_integer(),
            honor_retry_after: boolean(),
+           max_retry_after_ms: non_neg_integer(),
+           retryable_statuses: [integer()] | nil,
+           redact_token: String.t() | nil,
            sleep_fun: (non_neg_integer() -> term())
          }
 
@@ -92,6 +95,16 @@ defmodule PostDeploy.Transport do
     {raw_honor_retry_after, req_opts} = Keyword.pop(req_opts, :honor_retry_after, true)
     honor_retry_after = raw_honor_retry_after == true
 
+    {raw_max_retry_after_ms, req_opts} =
+      Keyword.pop(req_opts, :max_retry_after_ms, @max_retry_after_ms)
+
+    max_retry_after_ms =
+      if is_integer(raw_max_retry_after_ms) and raw_max_retry_after_ms >= 0,
+        do: raw_max_retry_after_ms,
+        else: @max_retry_after_ms
+
+    {retryable_statuses, req_opts} = Keyword.pop(req_opts, :retryable_statuses)
+    {redact_token, req_opts} = Keyword.pop(req_opts, :redact_token)
     {raw_sleep_fun, req_opts} = Keyword.pop(req_opts, :sleep_fun, &Process.sleep/1)
     sleep_fun = if is_function(raw_sleep_fun, 1), do: raw_sleep_fun, else: &Process.sleep/1
     req_opts = Keyword.put_new(req_opts, :retry, false)
@@ -101,6 +114,9 @@ defmodule PostDeploy.Transport do
       label: debug_label,
       max_attempts: max_attempts,
       honor_retry_after: honor_retry_after,
+      max_retry_after_ms: max_retry_after_ms,
+      retryable_statuses: retryable_statuses,
+      redact_token: if(is_binary(redact_token), do: redact_token, else: nil),
       sleep_fun: sleep_fun
     }
 
@@ -111,7 +127,10 @@ defmodule PostDeploy.Transport do
         log_debug(
           debug,
           debug_label,
-          "internal error: #{Exception.format(:error, error, __STACKTRACE__)}"
+          redact_message(
+            "internal error: #{Exception.format(:error, error, __STACKTRACE__)}",
+            redact_token
+          )
         )
     end
 
@@ -165,6 +184,9 @@ defmodule PostDeploy.Transport do
       status in @permanent_statuses ->
         :ok
 
+      not retryable_status?(status, opts.retryable_statuses) ->
+        :ok
+
       attempt_no >= opts.max_attempts ->
         log_debug(
           opts.debug,
@@ -177,7 +199,7 @@ defmodule PostDeploy.Transport do
       true ->
         delay_ms =
           if status == 429 and opts.honor_retry_after,
-            do: retry_after_ms(response) || backoff_ms(attempt_no),
+            do: retry_after_ms(response, opts.max_retry_after_ms) || backoff_ms(attempt_no),
             else: backoff_ms(attempt_no)
 
         opts.sleep_fun.(delay_ms)
@@ -187,17 +209,19 @@ defmodule PostDeploy.Transport do
 
   defp handle_attempt({:error, reason}, method, url, req_opts, attempt_no, opts)
        when is_integer(attempt_no) do
+    reason_text = redact_message(inspect(reason), opts.redact_token)
+
     log_debug(
       opts.debug,
       opts.label,
-      "failed: #{inspect(reason)} (attempt #{attempt_no}/#{opts.max_attempts})"
+      "failed: #{reason_text} (attempt #{attempt_no}/#{opts.max_attempts})"
     )
 
     if attempt_no >= opts.max_attempts do
       log_debug(
         opts.debug,
         opts.label,
-        "exhausted #{opts.max_attempts} attempts: #{inspect(reason)}"
+        "exhausted #{opts.max_attempts} attempts: #{reason_text}"
       )
 
       :ok
@@ -213,19 +237,22 @@ defmodule PostDeploy.Transport do
     round(exponential * jitter_factor)
   end
 
-  defp retry_after_ms(%Req.Response{} = response) do
+  defp retryable_status?(status, nil), do: status not in @permanent_statuses
+  defp retryable_status?(status, statuses), do: status in statuses
+
+  defp retry_after_ms(%Req.Response{} = response, max_retry_after_ms) do
     with [value | _] <- Req.Response.get_header(response, "retry-after"),
-         {seconds, _} <- Float.parse(value),
-         true <- seconds >= 0 do
-      min(round(seconds * 1000), @max_retry_after_ms)
+         true <- Regex.match?(~r/\A[0-9]+\z/, value) do
+      min(String.to_integer(value) * 1000, max_retry_after_ms)
     else
       _ -> nil
     end
   end
 
+  defp redact_message(message, nil), do: message
+  defp redact_message(message, token), do: String.replace(message, token, "[REDACTED]")
+
   defp log_debug(false, _label, _message), do: :ok
 
-  defp log_debug(true, label, message) do
-    Logger.debug("postdeploy_sdk: #{label} #{message}")
-  end
+  defp log_debug(true, label, message), do: Logger.debug("postdeploy_sdk: #{label} #{message}")
 end

@@ -152,7 +152,7 @@ defmodule PostDeploy.CoverageGapsTest do
     assert is_binary(Envelope.sdk_version())
 
     assert Envelope.message_item("err_1", "hi", "info")[:type] == "message"
-    session = %{id: "ses_1", status: :healthy, started_at: DateTime.utc_now()}
+    session = %{id: "ses_1", status: :healthy}
     assert Envelope.session_item(session).id == "ses_1"
 
     item =
