@@ -14,11 +14,6 @@ defmodule PostDeploy.Transport do
   @typep retry_opts :: %{
            debug: boolean(),
            label: String.t(),
-           max_attempts: pos_integer(),
-           honor_retry_after: boolean(),
-           max_retry_after_ms: non_neg_integer(),
-           retryable_statuses: [integer()] | nil,
-           redact_token: String.t() | nil,
            sleep_fun: (non_neg_integer() -> term())
          }
 
@@ -39,37 +34,16 @@ defmodule PostDeploy.Transport do
     )
   end
 
-  @doc "POSTs an already-encoded session-envelope body (issue #12) to `config.base_url <> \"/e/sessions\"`. Always returns `:ok`; never raises."
-  @spec post_sessions(Config.t(), String.t()) :: :ok
-  def post_sessions(%Config{} = config, body) when is_binary(body) do
-    url = String.trim_trailing(config.base_url, "/") <> "/e/sessions"
-
-    request(:post, url,
-      body: body,
-      headers: [
-        {"content-type", "application/json"},
-        {"authorization", "Bearer #{config.key}"}
-      ],
-      receive_timeout: config.receive_timeout,
-      debug: config.debug,
-      debug_label: "Session ingest"
-    )
-  end
-
   @doc """
-  Sends `method` to `url` with up to `:max_attempts` (default
-  #{@max_attempts}) total attempts, and jittered exponential backoff (base
-  #{@backoff_base_ms}ms) between them. A 429 response honors `Retry-After`
-  (capped at #{@max_retry_after_ms}ms) instead of the usual backoff, unless
-  `:honor_retry_after` is `false`. `req_opts` is forwarded to
-  `Req.request/1` as-is (`:body`, `:headers`, `:receive_timeout`, ...)
-  after stripping this function's own options:
+  Sends `method` to `url` with up to #{@max_attempts} total attempts, and
+  jittered exponential backoff (base #{@backoff_base_ms}ms) between them. A
+  429 response honors `Retry-After` (capped at #{@max_retry_after_ms}ms)
+  instead of the usual backoff. `req_opts` is forwarded to `Req.request/1`
+  as-is (`:body`, `:headers`, `:receive_timeout`, ...) after stripping this
+  function's own options:
 
     * `:debug` (default `false`) / `:debug_label` (default `"request"`) --
       diagnostic logging only.
-    * `:max_attempts` (default #{@max_attempts}) -- total attempt budget.
-    * `:honor_retry_after` (default `true`) -- whether a 429's
-      `Retry-After` overrides the usual backoff delay.
     * `:sleep_fun` (default `&Process.sleep/1`) -- the delay function
       called between attempts, injectable so a caller (namely this
       package's own tests) never has to wait on real wall-clock time,
@@ -85,40 +59,11 @@ defmodule PostDeploy.Transport do
     debug = debug == true
 
     {debug_label, req_opts} = Keyword.pop(req_opts, :debug_label, "request")
-    {raw_max_attempts, req_opts} = Keyword.pop(req_opts, :max_attempts, @max_attempts)
-
-    max_attempts =
-      if is_integer(raw_max_attempts) and raw_max_attempts > 0,
-        do: raw_max_attempts,
-        else: @max_attempts
-
-    {raw_honor_retry_after, req_opts} = Keyword.pop(req_opts, :honor_retry_after, true)
-    honor_retry_after = raw_honor_retry_after == true
-
-    {raw_max_retry_after_ms, req_opts} =
-      Keyword.pop(req_opts, :max_retry_after_ms, @max_retry_after_ms)
-
-    max_retry_after_ms =
-      if is_integer(raw_max_retry_after_ms) and raw_max_retry_after_ms >= 0,
-        do: raw_max_retry_after_ms,
-        else: @max_retry_after_ms
-
-    {retryable_statuses, req_opts} = Keyword.pop(req_opts, :retryable_statuses)
-    {redact_token, req_opts} = Keyword.pop(req_opts, :redact_token)
     {raw_sleep_fun, req_opts} = Keyword.pop(req_opts, :sleep_fun, &Process.sleep/1)
     sleep_fun = if is_function(raw_sleep_fun, 1), do: raw_sleep_fun, else: &Process.sleep/1
     req_opts = Keyword.put_new(req_opts, :retry, false)
 
-    opts = %{
-      debug: debug,
-      label: debug_label,
-      max_attempts: max_attempts,
-      honor_retry_after: honor_retry_after,
-      max_retry_after_ms: max_retry_after_ms,
-      retryable_statuses: retryable_statuses,
-      redact_token: if(is_binary(redact_token), do: redact_token, else: nil),
-      sleep_fun: sleep_fun
-    }
+    opts = %{debug: debug, label: debug_label, sleep_fun: sleep_fun}
 
     try do
       attempt(method, url, req_opts, 1, opts)
@@ -127,10 +72,7 @@ defmodule PostDeploy.Transport do
         log_debug(
           debug,
           debug_label,
-          redact_message(
-            "internal error: #{Exception.format(:error, error, __STACKTRACE__)}",
-            redact_token
-          )
+          "internal error: #{Exception.format(:error, error, __STACKTRACE__)}"
         )
     end
 
@@ -177,29 +119,26 @@ defmodule PostDeploy.Transport do
     log_debug(
       opts.debug,
       opts.label,
-      "responded #{status} (attempt #{attempt_no}/#{opts.max_attempts})"
+      "responded #{status} (attempt #{attempt_no}/#{@max_attempts})"
     )
 
     cond do
       status in @permanent_statuses ->
         :ok
 
-      not retryable_status?(status, opts.retryable_statuses) ->
-        :ok
-
-      attempt_no >= opts.max_attempts ->
+      attempt_no >= @max_attempts ->
         log_debug(
           opts.debug,
           opts.label,
-          "exhausted #{opts.max_attempts} attempts (last status #{status})"
+          "exhausted #{@max_attempts} attempts (last status #{status})"
         )
 
         :ok
 
       true ->
         delay_ms =
-          if status == 429 and opts.honor_retry_after,
-            do: retry_after_ms(response, opts.max_retry_after_ms) || backoff_ms(attempt_no),
+          if status == 429,
+            do: retry_after_ms(response) || backoff_ms(attempt_no),
             else: backoff_ms(attempt_no)
 
         opts.sleep_fun.(delay_ms)
@@ -209,19 +148,19 @@ defmodule PostDeploy.Transport do
 
   defp handle_attempt({:error, reason}, method, url, req_opts, attempt_no, opts)
        when is_integer(attempt_no) do
-    reason_text = redact_message(inspect(reason), opts.redact_token)
+    reason_text = inspect(reason)
 
     log_debug(
       opts.debug,
       opts.label,
-      "failed: #{reason_text} (attempt #{attempt_no}/#{opts.max_attempts})"
+      "failed: #{reason_text} (attempt #{attempt_no}/#{@max_attempts})"
     )
 
-    if attempt_no >= opts.max_attempts do
+    if attempt_no >= @max_attempts do
       log_debug(
         opts.debug,
         opts.label,
-        "exhausted #{opts.max_attempts} attempts: #{reason_text}"
+        "exhausted #{@max_attempts} attempts: #{reason_text}"
       )
 
       :ok
@@ -237,20 +176,14 @@ defmodule PostDeploy.Transport do
     round(exponential * jitter_factor)
   end
 
-  defp retryable_status?(status, nil), do: status not in @permanent_statuses
-  defp retryable_status?(status, statuses), do: status in statuses
-
-  defp retry_after_ms(%Req.Response{} = response, max_retry_after_ms) do
+  defp retry_after_ms(%Req.Response{} = response) do
     with [value | _] <- Req.Response.get_header(response, "retry-after"),
          true <- Regex.match?(~r/\A[0-9]+\z/, value) do
-      min(String.to_integer(value) * 1000, max_retry_after_ms)
+      min(String.to_integer(value) * 1000, @max_retry_after_ms)
     else
       _ -> nil
     end
   end
-
-  defp redact_message(message, nil), do: message
-  defp redact_message(message, token), do: String.replace(message, token, "[REDACTED]")
 
   defp log_debug(false, _label, _message), do: :ok
 

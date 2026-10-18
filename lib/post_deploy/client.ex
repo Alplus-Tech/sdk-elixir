@@ -81,20 +81,6 @@ defmodule PostDeploy.Client do
     _ -> :ok
   end
 
-  @doc """
-  Enqueues an already-built session-outcome item (issue #12), batched off
-  the request path exactly like `enqueue/2` but sent to `POST /e/sessions`
-  on its own queue -- a session outcome never shares a batch with an error
-  event, so a partial `/e/errors` failure can never affect session delivery
-  or vice versa. Fire-and-forget; never blocks the caller.
-  """
-  @spec enqueue_session(name(), map()) :: :ok
-  def enqueue_session(name \\ __MODULE__, item) do
-    GenServer.cast(name, {:enqueue_session, item})
-  rescue
-    _ -> :ok
-  end
-
   @doc "Forces an immediate send of whatever is queued. Returns `:ok` once the attempt (success or swallowed failure) completes, or `:timeout`."
   @spec flush(name(), timeout()) :: :ok | :timeout
   def flush(name \\ __MODULE__, timeout \\ 5_000) do
@@ -148,8 +134,6 @@ defmodule PostDeploy.Client do
        config: config,
        queue: [],
        queued_bytes: 0,
-       session_queue: [],
-       session_queued_bytes: 0,
        timer: nil,
        task_sup: task_sup,
        dedup: %{},
@@ -167,9 +151,7 @@ defmodule PostDeploy.Client do
     try do
       state = seal_all_pending(state)
       {items, state} = drain(cancel_timer(state))
-      {session_items, state} = drain_sessions(state)
       send_batch_sync(state.task_sup, state.config, items, state.name)
-      send_session_batch_sync(state.task_sup, state.config, session_items, state.name)
     after
       detach_host_hooks(state.hooks)
     end
@@ -251,58 +233,13 @@ defmodule PostDeploy.Client do
     end
   end
 
-  def handle_cast({:enqueue_session, _item}, %{config: %{enabled?: false}} = state) do
-    {:noreply, state}
-  end
-
-  # `session_queue` is a plain list, not a `SizedQueue` (unlike
-  # `sdks/ruby/lib/postdeploy/worker.rb`'s bounded queue) -- this guard is its
-  # equivalent bound, dropping the newest item (never blocking the caller)
-  # once `:session_queue_max_items` is reached, so a sustained ingest
-  # outage (every auto-flush failing, nothing ever draining the list)
-  # cannot grow this GenServer's memory without limit.
-  def handle_cast({:enqueue_session, _item}, state)
-      when length(state.session_queue) >= state.config.session_queue_max_items do
-    if state.config.debug,
-      do:
-        Logger.debug(
-          "postdeploy_sdk: session queue full (max #{state.config.session_queue_max_items}); dropping session"
-        )
-
-    {:noreply, state}
-  end
-
-  def handle_cast({:enqueue_session, item}, state) do
-    item_bytes = Envelope.byte_size_of(item)
-
-    state = %{
-      state
-      | session_queue: [item | state.session_queue],
-        session_queued_bytes: state.session_queued_bytes + item_bytes
-    }
-
-    cond do
-      length(state.session_queue) >= state.config.batch_max_items or
-          state.session_queued_bytes >= state.config.batch_max_bytes ->
-        {:noreply, do_flush_async(cancel_timer(state))}
-
-      state.timer == nil and state.config.flush_interval_ms > 0 ->
-        {:noreply, schedule_timer(state)}
-
-      true ->
-        {:noreply, state}
-    end
-  end
-
   @impl true
   def handle_call(:flush, _from, state) do
     # Seal the post-error log window first: flush means "send now with
     # whatever after-lines were collected so far", never "wait".
     state = seal_all_pending(state)
     {items, state} = drain(cancel_timer(state))
-    {session_items, state} = drain_sessions(state)
     send_batch_sync(state.task_sup, state.config, items, state.name)
-    send_session_batch_sync(state.task_sup, state.config, session_items, state.name)
     {:reply, :ok, state}
   end
 
@@ -392,36 +329,21 @@ defmodule PostDeploy.Client do
     {items, %{state | queue: [], queued_bytes: 0}}
   end
 
-  defp drain_sessions(state) do
-    items = Enum.reverse(state.session_queue)
-    {items, %{state | session_queue: [], session_queued_bytes: 0}}
-  end
-
   # Auto-triggered flush (batch-size threshold, idle timer): fires the send
   # in a task under this client's own Task.Supervisor and returns
   # immediately, so a slow/down ingest endpoint never backs up this
-  # GenServer's mailbox -- `enqueue/2`/`enqueue_session/2` casts must keep
-  # being processed while a send is in flight.
-  defp do_flush_async(%{queue: [], session_queue: []} = state), do: state
+  # GenServer's mailbox -- `enqueue/2` casts must keep being processed
+  # while a send is in flight.
+  defp do_flush_async(%{queue: []} = state), do: state
 
   defp do_flush_async(state) do
     {items, state} = drain(state)
-    {session_items, state} = drain_sessions(state)
     send_batch_async(state.task_sup, state.config, items, state.name)
-    send_session_batch_async(state.task_sup, state.config, session_items, state.name)
     state
   end
 
-  defp send_batch_async(_task_sup, _config, [], _name), do: :ok
-
   defp send_batch_async(task_sup, config, items, name) do
     start_async(task_sup, config, fn -> send_batch(config, items, name) end)
-  end
-
-  defp send_session_batch_async(_task_sup, _config, [], _name), do: :ok
-
-  defp send_session_batch_async(task_sup, config, items, name) do
-    start_async(task_sup, config, fn -> send_session_batch(config, items, name) end)
   end
 
   defp start_async(task_sup, config, fun) do
@@ -446,12 +368,6 @@ defmodule PostDeploy.Client do
     await_sync(task_sup, config, fn -> send_batch(config, items, name) end)
   end
 
-  defp send_session_batch_sync(_task_sup, _config, [], _name), do: :ok
-
-  defp send_session_batch_sync(task_sup, config, items, name) do
-    await_sync(task_sup, config, fn -> send_session_batch(config, items, name) end)
-  end
-
   defp await_sync(task_sup, config, fun) do
     task_sup
     |> Task.Supervisor.async_nolink(fun)
@@ -472,7 +388,7 @@ defmodule PostDeploy.Client do
 
       :ok
     else
-      deliver_body(config, name, :errors, body, fn -> Transport.post(config, body) end)
+      deliver_body(config, name, body)
     end
   rescue
     error ->
@@ -485,38 +401,8 @@ defmodule PostDeploy.Client do
       :ok
   end
 
-  defp send_session_batch(config, items, name) do
-    envelope = Envelope.build(config, Enum.map(items, &PostDeploy.Scrubber.scrub/1))
-    body = Jason.encode!(envelope)
-
-    if byte_size(body) > Config.max_envelope_bytes() do
-      if config.debug,
-        do:
-          Logger.debug(
-            "postdeploy_sdk: dropping oversized session envelope (#{length(items)} sessions)"
-          )
-
-      :ok
-    else
-      deliver_body(config, name, :sessions, body, fn -> Transport.post_sessions(config, body) end)
-    end
-  rescue
-    error ->
-      if config.debug,
-        do:
-          Logger.debug(
-            "postdeploy_sdk: internal error while flushing sessions: #{Exception.format(:error, error, __STACKTRACE__)}"
-          )
-
-      :ok
-  end
-
-  defp deliver_body(%{test?: true}, name, kind, body, _http) do
-    PostDeploy.Test.record(name, kind, body)
-    :ok
-  end
-
-  defp deliver_body(_config, _name, _kind, _body, http), do: http.()
+  defp deliver_body(%{test?: true}, name, body), do: PostDeploy.Test.record(name, body)
+  defp deliver_body(config, _name, body), do: Transport.post(config, body)
 
   defp attach_host_hooks(name, integrations) do
     hooks = %{logger: nil, phoenix: nil}

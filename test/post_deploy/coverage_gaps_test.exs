@@ -13,7 +13,6 @@ defmodule PostDeploy.CoverageGapsTest do
     LoggerHandler,
     Plug,
     Scope,
-    Session,
     Stack,
     Telemetry,
     Test
@@ -53,9 +52,7 @@ defmodule PostDeploy.CoverageGapsTest do
 
     assert is_binary(PostDeploy.capture_exception(%RuntimeError{message: "x"}))
     assert is_binary(PostDeploy.capture_message("hi"))
-    assert :ok = PostDeploy.close_session()
     assert :ok = PostDeploy.flush()
-    assert :ok = PostDeploy.heartbeat("hb_x", :nope)
 
     assert :ok = PostDeploy.set_user(%{id: 1})
     assert :ok = PostDeploy.set_tag(:k, :v)
@@ -74,34 +71,17 @@ defmodule PostDeploy.CoverageGapsTest do
     assert :ok = Client.notify_log_breadcrumb(name, %{message: "x"})
     refute Client.has_pending_exception?(name)
     assert :ok = Client.note_duplicate_capture(name, "err_x")
-    assert :ok = Client.enqueue_session(name, %{id: "ses_x"})
     assert :ok = Client.flush(name, 10)
     assert :ok = Client.reset_dedup(name)
     assert {:fresh, "err_new"} = Client.resolve_dedup(name, :sig, "err_new")
   end
 
-  test "flush timeout, disabled session enqueue, full session queue, and timer flush" do
-    name = start_client(session_queue_max_items: 1, flush_interval_ms: 15, batch_max_items: 100)
+  test "flush timeout and timer flush" do
+    name = start_client(flush_interval_ms: 15, batch_max_items: 100)
 
-    Client.enqueue_session(name, %{id: "ses_1"})
-    Client.enqueue_session(name, %{id: "ses_dropped"})
     Client.enqueue(name, %{type: "message", id: "err_timer", message: "m"})
     Process.sleep(40)
     assert :ok = Client.flush(name, 1)
-  end
-
-  test "async flush of sessions only hits the empty error-batch clause" do
-    name = start_client(batch_max_items: 1, flush_interval_ms: 0, post_error_log_window_ms: 0)
-    Client.enqueue_session(name, %{id: "ses_only"})
-    Process.sleep(20)
-    assert :ok = Client.flush(name)
-  end
-
-  test "disabled client drops session items" do
-    name = start_client(enabled?: false, key: "alp_p_cov")
-    Client.enqueue_session(name, %{id: "ses_off"})
-    assert :ok = Client.flush(name)
-    assert Test.sessions(name) == []
   end
 
   test "debug drop of oversized envelopes" do
@@ -114,9 +94,7 @@ defmodule PostDeploy.CoverageGapsTest do
       %{
         state
         | queue: [%{type: "message", id: "err_big", message: huge}],
-          queued_bytes: byte_size(huge),
-          session_queue: [%{id: "ses_big", message: huge}],
-          session_queued_bytes: byte_size(huge)
+          queued_bytes: byte_size(huge)
       }
     end)
 
@@ -136,14 +114,12 @@ defmodule PostDeploy.CoverageGapsTest do
 
   test "Test helpers, default names, and junk bodies" do
     name = start_client([])
-    Test.record(name, :errors, "not-json")
-    Test.record(name, :sessions, "{}")
+    Test.record(name, "not-json")
     assert Test.events(name) == []
-    assert Test.sessions(name) == []
-    assert is_list(Test.raw(:errors))
+    assert is_list(Test.raw())
     Test.reset!()
 
-    tasks = for _ <- 1..8, do: Task.async(fn -> Test.record(name, :errors, "{}") end)
+    tasks = for _ <- 1..8, do: Task.async(fn -> Test.record(name, "{}") end)
     Task.await_many(tasks)
   end
 
@@ -152,8 +128,6 @@ defmodule PostDeploy.CoverageGapsTest do
     assert is_binary(Envelope.sdk_version())
 
     assert Envelope.message_item("err_1", "hi", "info")[:type] == "message"
-    session = %{id: "ses_1", status: :healthy}
-    assert Envelope.session_item(session).id == "ses_1"
 
     item =
       Envelope.exception_item("err_2", %RuntimeError{message: "x"},
@@ -251,12 +225,8 @@ defmodule PostDeploy.CoverageGapsTest do
     assert :ok = Client.flush(name)
   end
 
-  test "plug, session, scope, telemetry, and dedup leftovers" do
+  test "plug, scope, telemetry, and dedup leftovers" do
     assert %{assigns: :ok} = Plug.call(%{assigns: :ok, not: :a_conn}, [])
-    assert :ok = Session.mark_errored()
-    Session.start()
-    Session.start()
-    assert :ok = Session.clear()
     assert :ok = Scope.set_context(:x, :nope)
     {mod, _msg} = Dedup.signature(%PostDeploy.CoverageGapsTest.BoomMsg{})
     assert mod == PostDeploy.CoverageGapsTest.BoomMsg
@@ -268,7 +238,7 @@ defmodule PostDeploy.CoverageGapsTest do
     Telemetry.detach(:cov_tel)
   end
 
-  test "before_send false and non-map, heartbeat without a client" do
+  test "before_send false and non-map" do
     name = start_client(before_send: fn _ -> :nope end)
     PostDeploy.capture_message("x", "info", name: name)
     assert :ok = Client.flush(name)
@@ -281,8 +251,6 @@ defmodule PostDeploy.CoverageGapsTest do
     name3 = start_client(before_send: fn _ -> nil end)
     PostDeploy.capture_message("nil-drop", "info", name: name3)
     assert :ok = Client.flush(name3)
-
-    assert :ok = PostDeploy.heartbeat("hb_tok")
   end
 
   defmodule ViaExit do
@@ -294,13 +262,11 @@ defmodule PostDeploy.CoverageGapsTest do
     assert :ok = Client.enqueue("not-a-name", %{id: "err_bad"})
     assert :ok = Client.notify_log_breadcrumb("not-a-name", %{message: "x"})
     assert :ok = Client.note_duplicate_capture("not-a-name", "err_x")
-    assert :ok = Client.enqueue_session("not-a-name", %{id: "ses_x"})
 
     via = {:via, ViaExit, :gone}
     assert :ok = Client.enqueue(via, %{id: "err_via"})
     assert :ok = Client.notify_log_breadcrumb(via, %{message: "x"})
     assert :ok = Client.note_duplicate_capture(via, "err_via")
-    assert :ok = Client.enqueue_session(via, %{id: "ses_via"})
 
     name = start_client([])
     pid = Process.whereis(name)
@@ -332,7 +298,6 @@ defmodule PostDeploy.CoverageGapsTest do
       )
 
     Client.enqueue(name, %{type: "exception", id: "err_term", message: "t"})
-    Client.enqueue_session(name, %{id: "ses_term"})
     assert :ok = GenServer.stop(pid, :normal)
     refute Process.alive?(pid)
   end
@@ -369,22 +334,14 @@ defmodule PostDeploy.CoverageGapsTest do
     assert :ok = Client.flush(name)
   end
 
-  test "flush rescue, capture rescue, heartbeat rescue, and fetch_config exit" do
+  test "flush rescue, capture rescue, and fetch_config exit" do
     assert :ok = PostDeploy.flush(:not_keyword)
     assert is_binary(PostDeploy.capture_message("x", "info", :not_keyword))
-    assert :ok = PostDeploy.heartbeat(:not_a_token)
 
     name = start_client([])
     Process.put(:__postdeploy_sdk_scope__, :not_a_scope)
     assert is_binary(PostDeploy.capture_exception(%RuntimeError{message: "x"}, name: name))
     Process.delete(:__postdeploy_sdk_scope__)
-
-    PostDeploy.Session.start()
-    assert :ok = PostDeploy.close_session(:not_keyword)
-
-    name = :"gone_#{System.unique_integer([:positive])}"
-    PostDeploy.Session.start()
-    assert :ok = PostDeploy.close_session(name: name)
 
     name2 = :"cfg_#{System.unique_integer([:positive])}"
 
@@ -410,7 +367,7 @@ defmodule PostDeploy.CoverageGapsTest do
     assert is_binary(PostDeploy.capture_message("s", "error", name: name2))
   end
 
-  test "async flush failure, encode failure, and oversized session envelope" do
+  test "async flush failure and encode failure" do
     name = start_client(debug: true, post_error_log_window_ms: 0, batch_max_items: 1)
     pid = Process.whereis(name)
     dead = spawn(fn -> :ok end)
@@ -425,23 +382,11 @@ defmodule PostDeploy.CoverageGapsTest do
       %{
         state
         | queue: [%{id: "err_ref", bad: make_ref()}],
-          queued_bytes: 1,
-          session_queue: [%{id: "ses_ref", bad: make_ref()}],
-          session_queued_bytes: 1
+          queued_bytes: 1
       }
     end)
 
     assert :ok = Client.flush(name2)
-
-    huge = String.duplicate("s", 2_000_000)
-    name3 = start_client(debug: true, post_error_log_window_ms: 0, flush_interval_ms: 0)
-    pid3 = Process.whereis(name3)
-
-    :sys.replace_state(pid3, fn state ->
-      %{state | session_queue: [%{id: "ses_huge", blob: huge}], session_queued_bytes: 2_000_000}
-    end)
-
-    assert :ok = Client.flush(name3)
   end
 
   test "sync flush timeout when the task supervisor is dead" do
@@ -450,17 +395,12 @@ defmodule PostDeploy.CoverageGapsTest do
     dead = spawn(fn -> :ok end)
     :sys.replace_state(pid, fn state -> %{state | task_sup: dead} end)
     Client.enqueue(name, %{type: "message", id: "err_sync", message: "x"})
-    Client.enqueue_session(name, %{id: "ses_sync"})
     assert :ok = Client.flush(name)
   end
 
-  test "scope update rescue, session bump rescue, and logger handler rescues" do
+  test "scope update rescue and logger handler rescues" do
     Process.put(:__postdeploy_sdk_scope__, :not_a_scope)
     assert :ok = PostDeploy.Scope.set_tag("k", "v")
-
-    Process.put(:__postdeploy_sdk_session__, :not_a_session)
-    assert :ok = PostDeploy.Session.mark_errored()
-    assert :ok = PostDeploy.Session.mark_crashed()
 
     assert :ok = LoggerHandler.log(%{level: :error, meta: :bad}, %{})
     assert :ok = LoggerHandler.log(%{level: :warning}, nil)
@@ -548,8 +488,6 @@ defmodule PostDeploy.CoverageGapsTest do
     assert :ok =
              PostDeploy.Transport.request(:post, "http://127.0.0.1:1/",
                debug: true,
-               max_attempts: :bad,
-               honor_retry_after: :no,
                sleep_fun: :bad
              )
   end
@@ -560,9 +498,8 @@ defmodule PostDeploy.CoverageGapsTest do
       assert is_pid(pid)
     end
 
-    Test.record(PostDeploy.Client, :errors, "{}")
+    Test.record(PostDeploy.Client, "{}")
     assert is_list(Test.events())
-    assert is_list(Test.sessions())
     assert :ok = Test.start_recorder()
     Test.reset!()
   end

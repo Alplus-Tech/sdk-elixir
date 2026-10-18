@@ -12,11 +12,11 @@ defmodule PostDeploy.Test do
   """
 
   @doc false
-  def record(name, kind, body) when kind in [:errors, :sessions] and is_binary(body) do
+  def record(name, body) when is_binary(body) do
     ensure_started()
 
     Agent.update(__MODULE__, fn state ->
-      Map.update(state, {name, kind}, [body], &(&1 ++ [body]))
+      Map.update(state, name, [body], &(&1 ++ [body]))
     end)
 
     :ok
@@ -25,28 +25,19 @@ defmodule PostDeploy.Test do
   @doc "Decoded Observe items recorded for `name` (default `PostDeploy.Client`)."
   @spec events(GenServer.name()) :: [map()]
   def events(name \\ PostDeploy.Client) do
-    raw(name, :errors)
-    |> Enum.flat_map(&items_of/1)
-  end
-
-  @doc "Decoded session items recorded for `name` (default `PostDeploy.Client`)."
-  @spec sessions(GenServer.name()) :: [map()]
-  def sessions(name \\ PostDeploy.Client) do
-    raw(name, :sessions)
+    raw(name)
     |> Enum.flat_map(&items_of/1)
   end
 
   @doc """
-  Encoded envelope bodies for `kind` (`:errors` or `:sessions`).
+  Encoded envelope bodies recorded for `name` (default `PostDeploy.Client`).
 
   The product e2e test POSTs these bytes to the real ingest route.
   """
-  @spec raw(GenServer.name(), :errors | :sessions) :: [binary()]
-  def raw(kind) when kind in [:errors, :sessions], do: raw(PostDeploy.Client, kind)
-
-  def raw(name, kind) when kind in [:errors, :sessions] do
+  @spec raw(GenServer.name()) :: [binary()]
+  def raw(name \\ PostDeploy.Client) do
     ensure_started()
-    Agent.get(__MODULE__, &Map.get(&1, {name, kind}, []))
+    Agent.get(__MODULE__, &Map.get(&1, name, []))
   end
 
   @doc "Drops recorded envelopes for `name` (default `PostDeploy.Client`)."
@@ -55,11 +46,7 @@ defmodule PostDeploy.Test do
     ensure_started()
     PostDeploy.Client.reset_dedup(name)
 
-    Agent.update(__MODULE__, fn state ->
-      state
-      |> Map.delete({name, :errors})
-      |> Map.delete({name, :sessions})
-    end)
+    Agent.update(__MODULE__, &Map.delete(&1, name))
   end
 
   defp items_of(body) do

@@ -12,7 +12,7 @@ defmodule PostDeploy.MixProject do
       start_permanent: Mix.env() == :prod,
       test_coverage: [summary: true, threshold: 99.9],
       deps: deps(),
-      description: "PostDeploy instrumentation for Elixir and Phoenix.",
+      description: "PostDeploy error tracking for Elixir and Phoenix.",
       package: package(),
       docs: [
         source_url: @source_url,

@@ -8,7 +8,7 @@ Setup guide: [Elixir and Phoenix error tracking](https://postdeploy.dev/docs/obs
 
 ```elixir
 # mix.exs
-{:postdeploy_sdk, "~> 0.2"}
+{:postdeploy_sdk, "~> 0.3"}
 ```
 
 Set `POSTDEPLOY_API_KEY` (an ingest key with the `ingest` scope).
@@ -28,7 +28,7 @@ plug PostDeploy.Plug
 
 `start_link/1` attaches the OTP logger handler and Phoenix
 `[:phoenix, :error_rendered]`. Unhandled crashes become Observe events.
-The plug opens a crash-free session per request.
+The plug resets scope and attaches request context per request.
 
 Identify the current user after the plug:
 
@@ -52,20 +52,6 @@ PostDeploy.capture_message("low disk space", "warning")
 
 Both calls return an `err_` event id and never raise, even if PostDeploy is
 unreachable.
-
-## Heartbeat
-
-```elixir
-PostDeploy.heartbeat(token)
-PostDeploy.heartbeat(token, :fail)
-```
-
-Heartbeat calls never raise. Each call makes at most two attempts and reuses
-one UUIDv4 `ping_id` across retries. The server deduplicates a supplied ID per
-monitor for 24 hours. Transport failures, `408`, `429`, and `5xx` responses
-retry only. Each attempt has a five-second timeout. Delta-seconds
-`Retry-After` is capped at two seconds; other retries use jittered backoff
-around 500ms. Diagnostics redact the full heartbeat token.
 
 ## Config
 

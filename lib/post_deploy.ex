@@ -1,6 +1,6 @@
 defmodule PostDeploy do
   @moduledoc """
-  Elixir client for PostDeploy Observe (`POST /e/errors`) and Monitor heartbeats.
+  Elixir client for PostDeploy error tracking (`POST /e/errors`).
 
   ## Setup
 
@@ -41,10 +41,7 @@ defmodule PostDeploy do
   enabled. That is a boot error, not a request error.
   """
 
-  alias PostDeploy.{Client, Config, Dedup, Envelope, Scope, Session, Transport}
-
-  @heartbeat_retryable_statuses [408, 429 | Enum.to_list(500..599)]
-  @type heartbeat_state :: :start | :finish | :fail | String.t()
+  alias PostDeploy.{Client, Config, Dedup, Envelope, Scope}
 
   defdelegate child_spec(opts), to: Client
 
@@ -93,8 +90,6 @@ defmodule PostDeploy do
   @spec capture_exception(Exception.t() | term(), keyword()) :: String.t()
   def capture_exception(exception, opts \\ []) do
     id = Client.generate_id()
-    level = Keyword.get(opts, :level, "error")
-    if level in ["error", "fatal"], do: mark_session_outcome()
 
     try do
       case fetch_config(opts) do
@@ -147,7 +142,6 @@ defmodule PostDeploy do
   @spec capture_message(term(), String.t(), keyword()) :: String.t()
   def capture_message(message, level \\ "info", opts \\ []) do
     id = Client.generate_id()
-    if level in ["error", "fatal"], do: mark_session_outcome()
 
     try do
       case fetch_config(opts) do
@@ -180,42 +174,6 @@ defmodule PostDeploy do
     id
   end
 
-  @doc false
-  @spec close_session(keyword()) :: :ok
-  def close_session(opts \\ []) do
-    case Session.current() do
-      nil ->
-        :ok
-
-      session ->
-        try do
-          case fetch_config(opts) do
-            {:ok, name, config} ->
-              item =
-                Envelope.session_item(session,
-                  release: config.release,
-                  environment: config.environment
-                )
-
-              Client.enqueue_session(name, item)
-
-            :not_running ->
-              :ok
-          end
-        rescue
-          _ -> :ok
-        after
-          Session.clear()
-        end
-    end
-
-    :ok
-  end
-
-  @doc false
-  @spec mark_session_crashed() :: :ok
-  def mark_session_crashed, do: Session.mark_crashed()
-
   @doc "Forces an immediate flush of the queue. See `PostDeploy.Client.flush/2`."
   @spec flush(keyword()) :: :ok | :timeout
   def flush(opts \\ []) do
@@ -225,71 +183,6 @@ defmodule PostDeploy do
     if Process.whereis(name), do: Client.flush(name, timeout), else: :ok
   rescue
     _ -> :ok
-  end
-
-  @doc """
-  Pings PostDeploy Monitor's `GET|POST /h/:token` for cron/job liveness
-  (ARCHITECTURE.md §8): the token is the auth, `state` selects `?state=`
-  (`:start` | `:finish` | `:fail`, default `:finish`; an unrecognized state
-  falls back to `:finish` rather than raising -- a heartbeat call still
-  records that the job ran). Recognized token -> 202 (even paused); unknown
-  token -> 404 (swallowed the same as every other non-2xx below).
-
-  A single `ping_id` (a bare UUIDv4, `PostDeploy.Id.generate_ping_id/0`) is
-  generated once per call and reused across every retry attempt as
-  `?ping_id=`. The server deduplicates it per monitor for 24 hours.
-
-  Makes at most two attempts. It retries transport failures, `408`, `429`, and
-  `5xx` responses only. Each attempt has a five-second receive timeout.
-  A delta-seconds `Retry-After` is capped at two seconds. Other retries use
-  jittered backoff around 500ms. Debug diagnostics redact the heartbeat token.
-
-  The base URL resolves the same way `PostDeploy.Config` does -- a running
-  named `PostDeploy.Client`'s own `start_link/1` `:base_url` first (so a self-
-  hosted ingest endpoint configured only via `start_link` opts is still honored),
-  then `Application.get_env(:postdeploy_sdk, :config, base_url: ...)`, then
-  `POSTDEPLOY_INGEST_URL`, then the default. A running client is not required.
-
-  `transport_opts` forwards additional options to the HTTP adapter, namely
-  `:sleep_fun` for this package's tests. It is not part of the public contract.
-
-  Fail-safe and off the request path: always returns `:ok`, never raises,
-  even if `token` isn't a binary.
-  """
-  @spec heartbeat(String.t(), heartbeat_state(), keyword()) :: :ok
-  def heartbeat(token, state \\ :finish, transport_opts \\ []) do
-    try do
-      ping_id = PostDeploy.Id.generate_ping_id()
-      token = if is_binary(token), do: token, else: inspect(token)
-
-      url =
-        heartbeat_base_url() <>
-          "/h/" <>
-          URI.encode(token, &URI.char_unreserved?/1) <>
-          "?state=" <> heartbeat_state_param(state) <> "&ping_id=" <> ping_id
-
-      Transport.request(
-        :post,
-        url,
-        Keyword.merge(
-          [
-            receive_timeout: 5_000,
-            debug: heartbeat_debug(),
-            debug_label: "heartbeat",
-            redact_token: token,
-            max_attempts: 2,
-            max_retry_after_ms: 2_000,
-            retryable_statuses: @heartbeat_retryable_statuses,
-            honor_retry_after: true
-          ],
-          transport_opts
-        )
-      )
-    rescue
-      _ -> :ok
-    end
-
-    :ok
   end
 
   @doc """
@@ -324,35 +217,8 @@ defmodule PostDeploy do
     Scope.add_breadcrumb(breadcrumb)
   end
 
-  defp heartbeat_state_param(state) when state in [:start, :finish, :fail],
-    do: Atom.to_string(state)
-
-  defp heartbeat_state_param(_other), do: "finish"
-
-  defp heartbeat_base_url do
-    case fetch_config([]) do
-      {:ok, _name, config} -> config.base_url
-      :not_running -> heartbeat_base_url_fallback()
-    end
-    |> String.trim_trailing("/")
-  end
-
-  defp heartbeat_base_url_fallback do
-    app_env = Application.get_env(:postdeploy_sdk, :config, [])
-
-    Keyword.get(app_env, :base_url) || System.get_env("POSTDEPLOY_INGEST_URL") ||
-      "https://ingest.postdeploy.dev"
-  end
-
   defp stringify_message(message) when is_binary(message), do: message
   defp stringify_message(message), do: inspect(message)
-
-  defp heartbeat_debug do
-    case fetch_config([]) do
-      {:ok, _name, config} -> config.debug == true
-      :not_running -> false
-    end
-  end
 
   defp fetch_config(opts) do
     name = Keyword.get(opts, :name, Client)
@@ -365,12 +231,6 @@ defmodule PostDeploy do
   catch
     :exit, _ -> :not_running
   end
-
-  # Any `"error"`/`"fatal"`-level capture during the current session marks
-  # it (at least) `:errored` -- a no-op if the session is already
-  # `:crashed` (see `PostDeploy.Session`'s severity ordering) or if no
-  # session was started (e.g. a background job, not a request).
-  defp mark_session_outcome, do: Session.mark_errored()
 
   defp resolve_dedup(name, exception, fresh_id) do
     Client.resolve_dedup(name, Dedup.signature(exception), fresh_id)

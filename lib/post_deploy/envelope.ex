@@ -104,23 +104,6 @@ defmodule PostDeploy.Envelope do
     |> compact()
   end
 
-  @doc """
-  Builds a `POST /e/sessions` wire item (issue #12) from an
-  `PostDeploy.Session.t()`. Carries no PII: `session.id` is opaque and used
-  server-side only for in-window ingest dedup, then discarded (never stored
-  raw) -- matching `Alplus.Observe.SessionEnvelope`, the server parser.
-  """
-  @spec session_item(PostDeploy.Session.t(), keyword()) :: map()
-  def session_item(%{id: id, status: status}, opts \\ []) do
-    %{
-      id: id,
-      status: Atom.to_string(status),
-      release: Keyword.get(opts, :release),
-      environment: Keyword.get(opts, :environment)
-    }
-    |> compact()
-  end
-
   @doc "Serialized byte size of an already-built item, used for batch-size accounting."
   @spec byte_size_of(map()) :: non_neg_integer()
   def byte_size_of(item), do: item |> Jason.encode!() |> byte_size()

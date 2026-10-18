@@ -127,62 +127,6 @@ defmodule PostDeploy.TransportTest do
     refute_receive {:attempt, 4}, 100
   end
 
-  test "max_attempts overrides the default retry budget (e.g. heartbeat's smaller one)", %{
-    bypass: bypass,
-    counter: counter,
-    sleep_fun: sleep_fun
-  } do
-    test_pid = self()
-
-    Bypass.expect(bypass, "POST", "/h/tok", fn conn ->
-      send(test_pid, {:attempt, next_call_count(counter)})
-      Plug.Conn.resp(conn, 500, "boom")
-    end)
-
-    :ok =
-      Transport.request(:post, "http://localhost:#{bypass.port}/h/tok",
-        max_attempts: 2,
-        sleep_fun: sleep_fun
-      )
-
-    assert_receive {:attempt, 1}, 1_000
-    assert_receive {:attempt, 2}, 1_000
-    refute_receive {:attempt, 3}, 100
-  end
-
-  test "honor_retry_after: false ignores Retry-After and uses the usual backoff instead", %{
-    bypass: bypass,
-    counter: counter,
-    delays: delays,
-    sleep_fun: sleep_fun
-  } do
-    test_pid = self()
-
-    Bypass.expect(bypass, "POST", "/h/tok", fn conn ->
-      count = next_call_count(counter)
-      send(test_pid, {:attempt, count})
-
-      if count == 1 do
-        conn
-        |> Plug.Conn.put_resp_header("retry-after", "20")
-        |> Plug.Conn.resp(429, "slow down")
-      else
-        Plug.Conn.resp(conn, 202, "{}")
-      end
-    end)
-
-    :ok =
-      Transport.request(:post, "http://localhost:#{bypass.port}/h/tok",
-        honor_retry_after: false,
-        sleep_fun: sleep_fun
-      )
-
-    assert_receive {:attempt, 1}, 1_000
-    assert_receive {:attempt, 2}, 1_000
-    assert [delay] = recorded_delays(delays)
-    assert delay < 20_000
-  end
-
   test "request/3 never raises even against an unreachable host" do
     assert :ok ==
              Transport.request(:post, "http://127.0.0.1:1",

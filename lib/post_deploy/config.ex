@@ -17,7 +17,6 @@ defmodule PostDeploy.Config do
             context_lines: 3,
             sample_rate: 1.0,
             debug: false,
-            session_queue_max_items: 1_000,
             # Post-error log window in ms (issue #47): an exception item
             # lingers in the client so Logger lines the erroring process
             # writes just afterwards join its breadcrumb timeline, marked
@@ -40,7 +39,6 @@ defmodule PostDeploy.Config do
           context_lines: non_neg_integer(),
           sample_rate: float(),
           debug: boolean(),
-          session_queue_max_items: pos_integer(),
           post_error_log_window_ms: non_neg_integer(),
           before_send: (map() -> map() | nil) | nil,
           test?: boolean()

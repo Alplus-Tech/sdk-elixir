@@ -39,7 +39,7 @@ defmodule PostDeploy.PublishedInterfaceTest do
     [item] = Test.events(name)
     assert item["type"] == "exception"
     assert item["exception"]["value"] == "boom"
-    assert [body] = Test.raw(name, :errors)
+    assert [body] = Test.raw(name)
     assert is_binary(body)
   end
 
