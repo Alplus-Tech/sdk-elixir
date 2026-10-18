@@ -1,5 +1,7 @@
 # postdeploy_sdk
 
+> **Retired.** This SDK is no longer maintained and receives no updates. PostDeploy accepts events from the official Sentry SDKs. Install `sentry` and use the DSN that PostDeploy shows for your source. See https://postdeploy.dev/docs.
+
 Error reporting for [PostDeploy Observe](https://postdeploy.dev). Elixir and Phoenix.
 
 Setup guide: [Elixir and Phoenix error tracking](https://postdeploy.dev/docs/observe/elixir).
